@@ -59,6 +59,21 @@ body {
   cursor: pointer; width: 100%;
 }
 .run-btn:disabled { opacity: .5; cursor: not-allowed; }
+.feat-head { display: flex; align-items: center; justify-content: space-between;
+  flex-wrap: wrap; gap: 8px; }
+.feat-actions { display: flex; align-items: center; gap: 8px; }
+.feat-count { font-size: 12px; color: var(--muted); }
+.feat-group { margin-top: 12px; }
+.feat-group-title { font-size: 11px; color: var(--accent2); font-weight: 600;
+  margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.4px; }
+.feat-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.feat-chip { display: inline-flex; align-items: center; gap: 7px; cursor: pointer;
+  background: var(--panel2); border: 1px solid var(--border); color: var(--muted);
+  padding: 7px 12px; border-radius: 20px; font-size: 13px; transition: all .12s ease;
+  user-select: none; }
+.feat-chip:hover { border-color: var(--accent); }
+.feat-chip.on { background: rgba(79,140,255,.15); border-color: var(--accent); color: var(--text); }
+.feat-chip input { accent-color: var(--accent); margin: 0; cursor: pointer; }
 .progress-wrap { background: var(--panel2); border-radius: 8px; height: 12px; overflow: hidden; }
 .progress-bar { background: linear-gradient(90deg, var(--accent2), var(--accent)); height: 100%;
   transition: width .3s ease; }

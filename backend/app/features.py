@@ -34,6 +34,51 @@ TA_COLUMNS = [
 
 TRAINING_COLUMNS = V1_COLUMNS + TA_COLUMNS
 
+# 프론트 체크박스 UI 용 지표 메타데이터 (id/label/group).
+# group 으로 묶어 화면에서 그룹별 표시한다.
+FEATURE_META = [
+    # --- 가격/거래량 비율 (quantylab v1) ---
+    {"id": "open_lastclose_ratio", "label": "시가/전일종가", "group": "가격·거래량 비율"},
+    {"id": "high_close_ratio", "label": "고가/종가", "group": "가격·거래량 비율"},
+    {"id": "low_close_ratio", "label": "저가/종가", "group": "가격·거래량 비율"},
+    {"id": "close_lastclose_ratio", "label": "종가/전일종가", "group": "가격·거래량 비율"},
+    {"id": "volume_lastvolume_ratio", "label": "거래량/전일거래량", "group": "가격·거래량 비율"},
+    {"id": "close_ma5_ratio", "label": "종가 MA5 이격도", "group": "이동평균 이격도"},
+    {"id": "volume_ma5_ratio", "label": "거래량 MA5 이격도", "group": "이동평균 이격도"},
+    {"id": "close_ma10_ratio", "label": "종가 MA10 이격도", "group": "이동평균 이격도"},
+    {"id": "volume_ma10_ratio", "label": "거래량 MA10 이격도", "group": "이동평균 이격도"},
+    {"id": "close_ma20_ratio", "label": "종가 MA20 이격도", "group": "이동평균 이격도"},
+    {"id": "volume_ma20_ratio", "label": "거래량 MA20 이격도", "group": "이동평균 이격도"},
+    {"id": "close_ma60_ratio", "label": "종가 MA60 이격도", "group": "이동평균 이격도"},
+    {"id": "volume_ma60_ratio", "label": "거래량 MA60 이격도", "group": "이동평균 이격도"},
+    {"id": "close_ma120_ratio", "label": "종가 MA120 이격도", "group": "이동평균 이격도"},
+    {"id": "volume_ma120_ratio", "label": "거래량 MA120 이격도", "group": "이동평균 이격도"},
+    # --- 기술적 지표 (보고서 의사결정③) ---
+    {"id": "rsi14", "label": "RSI(14)", "group": "기술적 지표"},
+    {"id": "stoch_k", "label": "스토캐스틱 %K", "group": "기술적 지표"},
+    {"id": "stoch_d", "label": "스토캐스틱 %D", "group": "기술적 지표"},
+    {"id": "cci14", "label": "CCI(14)", "group": "기술적 지표"},
+    {"id": "macd_signal_ratio", "label": "MACD-시그널", "group": "기술적 지표"},
+    {"id": "boll_upper_ratio", "label": "볼린저 상단 이격도", "group": "기술적 지표"},
+    {"id": "boll_lower_ratio", "label": "볼린저 하단 이격도", "group": "기술적 지표"},
+    {"id": "mfi14", "label": "MFI(14)", "group": "기술적 지표"},
+]
+
+
+def resolve_feature_columns(selected) -> List[str]:
+    """선택된 지표 id 리스트를 검증해 TRAINING_COLUMNS 순서대로 정렬해 반환.
+
+    None/빈 값이면 전체(TRAINING_COLUMNS)를 사용한다. 알 수 없는 id 는 무시하고,
+    유효한 지표가 하나도 없으면 오류를 낸다.
+    """
+    if not selected:
+        return list(TRAINING_COLUMNS)
+    selected_set = set(selected)
+    cols = [c for c in TRAINING_COLUMNS if c in selected_set]
+    if not cols:
+        raise ValueError("선택된 state 지표가 없습니다. 최소 1개 이상 선택해주세요.")
+    return cols
+
 
 def _v1_ratios(df: pd.DataFrame) -> pd.DataFrame:
     windows = [5, 10, 20, 60, 120]

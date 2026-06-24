@@ -32,6 +32,9 @@ export default function App() {
   const [lr, setLr] = useState(0.0005)
   const [showAdv, setShowAdv] = useState(false)
 
+  const [featureMeta, setFeatureMeta] = useState([])
+  const [selectedFeatures, setSelectedFeatures] = useState([])
+
   const [job, setJob] = useState(null)
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
@@ -41,7 +44,22 @@ export default function App() {
     api.stocks().then(setStocks).catch(() => {})
     api.algorithms().then(setAlgos).catch(() => {})
     api.health().then(setHealth).catch(() => setHealth({ status: 'down' }))
+    api.features().then((fs) => {
+      setFeatureMeta(fs)
+      setSelectedFeatures(fs.map((f) => f.id)) // 기본값: 전체 선택
+    }).catch(() => {})
   }, [])
+
+  function toggleFeature(id) {
+    setSelectedFeatures((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id])
+  }
+
+  // group -> [feature, ...] 로 묶기 (메타 순서 유지)
+  const featureGroups = featureMeta.reduce((acc, f) => {
+    (acc[f.group] = acc[f.group] || []).push(f)
+    return acc
+  }, {})
 
   useEffect(() => () => clearInterval(pollRef.current), [])
 
@@ -56,6 +74,7 @@ export default function App() {
         train_start: trainStart, train_end: trainEnd,
         test_start: testStart, test_end: testEnd,
         num_epoches: Number(epochs), lr: Number(lr),
+        features: selectedFeatures,
       })
       setJob({ status: 'queued', phase: 'queued', progress: 0 })
       pollRef.current = setInterval(async () => {
@@ -131,7 +150,39 @@ export default function App() {
       </div>
 
       <div className="panel">
-        <h2>③ 기간 설정</h2>
+        <div className="feat-head">
+          <h2>③ State 지표 선택</h2>
+          <div className="feat-actions">
+            <span className="feat-count">{selectedFeatures.length} / {featureMeta.length} 선택</span>
+            <button className="btn small"
+              onClick={() => setSelectedFeatures(featureMeta.map((f) => f.id))}>전체 선택</button>
+            <button className="btn small"
+              onClick={() => setSelectedFeatures([])}>전체 해제</button>
+          </div>
+        </div>
+        <p className="note" style={{ marginTop: 0 }}>
+          체크된 지표만 학습 state(관측값)로 사용됩니다. 최소 1개 이상 선택하세요.
+        </p>
+        {Object.entries(featureGroups).map(([group, items]) => (
+          <div key={group} className="feat-group">
+            <div className="feat-group-title">{group}</div>
+            <div className="feat-list">
+              {items.map((f) => (
+                <label key={f.id}
+                  className={`feat-chip ${selectedFeatures.includes(f.id) ? 'on' : ''}`}>
+                  <input type="checkbox"
+                    checked={selectedFeatures.includes(f.id)}
+                    onChange={() => toggleFeature(f.id)} />
+                  {f.label}
+                </label>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="panel">
+        <h2>④ 기간 설정</h2>
         <div className="grid-dates">
           <div>
             <div className="period-tag">학습 기간 (Train)</div>
@@ -173,8 +224,10 @@ export default function App() {
 
       <div className="panel">
         <button className="run-btn" onClick={start}
-          disabled={running || (health && !health.kis_configured)}>
-          {running ? `${PHASE_LABEL[job.phase] || '진행 중'}…` : '▶ 학습 + 백테스트 실행'}
+          disabled={running || (health && !health.kis_configured) || selectedFeatures.length === 0}>
+          {running ? `${PHASE_LABEL[job.phase] || '진행 중'}…`
+            : selectedFeatures.length === 0 ? '▶ State 지표를 1개 이상 선택하세요'
+            : '▶ 학습 + 백테스트 실행'}
         </button>
         {job && running && (
           <div style={{ marginTop: 14 }}>
