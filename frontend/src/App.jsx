@@ -5,6 +5,7 @@ import MetricsTable from './components/MetricsTable'
 import PriceTradeChart from './components/PriceTradeChart'
 import TradeLog from './components/TradeLog'
 
+// 엔진 메타가 로드되기 전 사용할 기본 네트워크 목록(quantylab)
 const NETS = [
   { id: 'dnn', label: 'DNN', sub: '완전연결' },
   { id: 'lstm', label: 'LSTM', sub: '시계열' },
@@ -21,9 +22,13 @@ export default function App() {
   const [algos, setAlgos] = useState([])
   const [health, setHealth] = useState(null)
 
+  const [engines, setEngines] = useState({})
+  const [engine, setEngine] = useState('quantylab')
+
   const [stock, setStock] = useState('005930')
   const [algo, setAlgo] = useState('dqn')
   const [net, setNet] = useState('dnn')
+  const [windowSize, setWindowSize] = useState(20)
   const [trainStart, setTrainStart] = useState('2022-01-01')
   const [trainEnd, setTrainEnd] = useState('2024-06-30')
   const [testStart, setTestStart] = useState('2024-07-01')
@@ -43,12 +48,30 @@ export default function App() {
   useEffect(() => {
     api.stocks().then(setStocks).catch(() => {})
     api.algorithms().then(setAlgos).catch(() => {})
+    api.engines().then(setEngines).catch(() => {})
     api.health().then(setHealth).catch(() => setHealth({ status: 'down' }))
     api.features().then((fs) => {
       setFeatureMeta(fs)
       setSelectedFeatures(fs.map((f) => f.id)) // 기본값: 전체 선택
     }).catch(() => {})
   }, [])
+
+  // 현재 엔진의 알고리즘/네트워크 목록 (엔진 메타 로드 전엔 기본값)
+  const engMeta = engines[engine]
+  const algoList = engMeta ? engMeta.algorithms : algos
+  const netList = engMeta ? engMeta.networks : NETS
+  const paramKind = engMeta ? engMeta.param_kind : 'epoches'
+
+  // 엔진을 바꾸면 해당 엔진의 첫 알고리즘/네트워크로 초기화
+  function switchEngine(next) {
+    if (next === engine) return
+    setEngine(next)
+    const m = engines[next]
+    if (m) {
+      if (m.algorithms?.length) setAlgo(m.algorithms[0].id)
+      if (m.networks?.length) setNet((m.networks[1] || m.networks[0]).id)
+    }
+  }
 
   function toggleFeature(id) {
     setSelectedFeatures((prev) =>
@@ -69,13 +92,19 @@ export default function App() {
     setError(null)
     setResult(null)
     try {
-      const { job_id } = await api.train({
-        stock_code: stock, algorithm: algo, net,
+      const body = {
+        stock_code: stock, engine, algorithm: algo, net,
         train_start: trainStart, train_end: trainEnd,
         test_start: testStart, test_end: testEnd,
-        num_epoches: Number(epochs), lr: Number(lr),
-        features: selectedFeatures,
-      })
+        lr: Number(lr), features: selectedFeatures,
+      }
+      if (engine === 'hanium') {
+        body.episodes = Number(epochs)
+        body.window_size = Number(windowSize)
+      } else {
+        body.num_epoches = Number(epochs)
+      }
+      const { job_id } = await api.train(body)
       setJob({ status: 'queued', phase: 'queued', progress: 0 })
       pollRef.current = setInterval(async () => {
         try {
@@ -104,7 +133,7 @@ export default function App() {
     <div className="app">
       <div className="header">
         <h1>강화학습 AI 트레이딩 프로토타입</h1>
-        <p>국내 개별주 · DQN/A2C/PPO · 학습/테스트 기간을 설정해 단순보유 대비 성과를 비교합니다.</p>
+        <p>국내 개별주 · 2개 엔진(quantylab/hanium) · 학습/테스트 기간을 설정해 단순보유 대비 성과를 비교합니다.</p>
       </div>
 
       {health && !health.kis_configured && (
@@ -128,18 +157,38 @@ export default function App() {
       </div>
 
       <div className="panel">
-        <h2>② 알고리즘</h2>
+        <h2>② 엔진</h2>
         <div className="row">
-          {algos.map((a) => (
+          {Object.entries(engines).map(([id, m]) => (
+            <button key={id}
+              className={`btn algo ${engine === id ? 'active' : ''}`}
+              onClick={() => switchEngine(id)}>
+              {m.label} <span className="sub">{m.desc}</span>
+            </button>
+          ))}
+          {Object.keys(engines).length === 0 && (
+            <span className="note">엔진 목록을 불러오는 중…</span>
+          )}
+        </div>
+      </div>
+
+      <div className="panel">
+        <h2>③ 알고리즘 · 네트워크</h2>
+        <div className="feat-group-title">알고리즘 ({algoList.length}종)</div>
+        <div className="row">
+          {algoList.map((a) => (
             <button key={a.id}
               className={`btn algo ${algo === a.id ? 'active' : ''}`}
-              onClick={() => { setAlgo(a.id); setNet(a.net_default) }}>
+              onClick={() => { setAlgo(a.id); if (a.net_default) setNet(a.net_default) }}>
               {a.label} <span className="sub">{a.desc}</span>
             </button>
           ))}
         </div>
-        <div className="row" style={{ marginTop: 12 }}>
-          {NETS.map((nw) => (
+        <div className="feat-group-title" style={{ marginTop: 14 }}>
+          네트워크 ({netList.length}종) — 특성 추출기
+        </div>
+        <div className="row">
+          {netList.map((nw) => (
             <button key={nw.id}
               className={`btn small ${net === nw.id ? 'active' : ''}`}
               onClick={() => setNet(nw.id)}>
@@ -147,11 +196,17 @@ export default function App() {
             </button>
           ))}
         </div>
+        {engine === 'hanium' && (
+          <p className="note" style={{ marginTop: 10 }}>
+            hanium 엔진은 알고리즘 10종 × 네트워크 8종을 자유롭게 조합해 실험할 수 있습니다.
+            (거래세 0.25% · 수수료 · 액션 마스킹이 환경에 이식되어 있습니다.)
+          </p>
+        )}
       </div>
 
       <div className="panel">
         <div className="feat-head">
-          <h2>③ State 지표 선택</h2>
+          <h2>④ State 지표 선택</h2>
           <div className="feat-actions">
             <span className="feat-count">{selectedFeatures.length} / {featureMeta.length} 선택</span>
             <button className="btn small"
@@ -182,7 +237,7 @@ export default function App() {
       </div>
 
       <div className="panel">
-        <h2>④ 기간 설정</h2>
+        <h2>⑤ 기간 설정</h2>
         <div className="grid-dates">
           <div>
             <div className="period-tag">학습 기간 (Train)</div>
@@ -204,16 +259,23 @@ export default function App() {
           </div>
         </div>
         <button className="toggle-adv" onClick={() => setShowAdv(!showAdv)}>
-          {showAdv ? '− 고급 설정 숨기기' : '+ 고급 설정 (에폭/학습률)'}
+          {showAdv ? '− 고급 설정 숨기기'
+            : `+ 고급 설정 (${paramKind === 'episodes' ? '에피소드/윈도우/' : '에폭/'}학습률)`}
         </button>
         {showAdv && (
           <div className="sub-grid" style={{ marginTop: 10 }}>
-            <div className="field"><label>학습 에폭 수 (num_epoches)</label>
+            <div className="field">
+              <label>{paramKind === 'episodes' ? '학습 에피소드 수 (episodes)' : '학습 에폭 수 (num_epoches)'}</label>
               <input type="number" min="1" max="2000" value={epochs}
                 onChange={(e) => setEpochs(e.target.value)} /></div>
             <div className="field"><label>학습률 (lr)</label>
               <input type="number" step="0.0001" value={lr}
                 onChange={(e) => setLr(e.target.value)} /></div>
+            {engine === 'hanium' && (
+              <div className="field"><label>관측 윈도우 (window_size, 일)</label>
+                <input type="number" min="5" max="120" value={windowSize}
+                  onChange={(e) => setWindowSize(e.target.value)} /></div>
+            )}
           </div>
         )}
         <div className="note">
@@ -236,7 +298,7 @@ export default function App() {
             </div>
             <div className="progress-meta">
               <span>{PHASE_LABEL[job.phase] || job.phase}
-                {job.phase === 'training' && job.total ? ` (${job.step}/${job.total} 에폭)` : ''}</span>
+                {job.phase === 'training' && job.total ? ` (${job.step}/${job.total} 회차)` : ''}</span>
               <span>{progressPct}%</span>
             </div>
           </div>
