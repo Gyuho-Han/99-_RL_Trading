@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from . import config, engine, jobs
+from . import config, engine, jobs, features
 
 app = FastAPI(title="강화학습 AI 트레이딩 프로토타입", version="0.1.0")
 
@@ -37,6 +37,8 @@ class TrainRequest(BaseModel):
     discount_factor: float = Field(0.9, gt=0, le=1)
     num_steps: int | None = Field(None, ge=1, le=30)
     balance: int = Field(10_000_000, gt=0)
+    # state 에 포함할 지표 id 목록. None/빈 값이면 전체 지표 사용.
+    features: list[str] | None = None
 
 
 @app.get("/api/health")
@@ -53,6 +55,12 @@ def stocks():
 @app.get("/api/algorithms")
 def algorithms():
     return [{"id": k, **v} for k, v in engine.ALGORITHMS.items()]
+
+
+@app.get("/api/features")
+def feature_list():
+    """state 에 넣을 수 있는 지표 목록(체크박스 UI 용)."""
+    return features.FEATURE_META
 
 
 @app.post("/api/train")

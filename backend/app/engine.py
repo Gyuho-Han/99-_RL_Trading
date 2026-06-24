@@ -98,6 +98,9 @@ def run_experiment(params: Dict, progress_callback: Optional[Callable] = None) -
     min_tp = int(params.get("min_trading_price", 100_000))
     max_tp = int(params.get("max_trading_price", 1_000_000))
 
+    # state 에 포함할 지표 선택 (없으면 전체). 검증 후 정렬된 컬럼 리스트.
+    feature_cols = features.resolve_feature_columns(params.get("features"))
+
     train_start = params["train_start"].replace("-", "")
     train_end = params["train_end"].replace("-", "")
     test_start = params["test_start"].replace("-", "")
@@ -125,9 +128,9 @@ def run_experiment(params: Dict, progress_callback: Optional[Callable] = None) -
     if len(chart_te) < num_steps + 2:
         raise ValueError("테스트 구간 데이터가 너무 적습니다. 테스트 기간을 늘려주세요.")
 
-    # training_data 는 순수 피처만 (date 제외)
-    td_tr = feat_tr[features.TRAINING_COLUMNS]
-    td_te = feat_te[features.TRAINING_COLUMNS]
+    # training_data 는 순수 피처만 (date 제외). 선택된 지표만 state 로 사용.
+    td_tr = feat_tr[feature_cols]
+    td_te = feat_te[feature_cols]
     cd_tr = chart_tr[features.CHART_COLUMNS]
     cd_te = chart_te[features.CHART_COLUMNS]
 
@@ -221,6 +224,7 @@ def run_experiment(params: Dict, progress_callback: Optional[Callable] = None) -
         "net": net,
         "num_steps": num_steps,
         "num_epoches": num_epoches,
+        "features": feature_cols,
         "train_period": [train_start, train_end],
         "test_period": [test_start, test_end],
         "n_train": int(len(cd_tr)),
