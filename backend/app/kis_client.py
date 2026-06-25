@@ -129,6 +129,9 @@ def _fetch_daily_chunk(code: str, start: str, end: str, max_retries: int = 5) ->
         for r in out:
             if not r or not r.get("stck_bsop_date"):
                 continue
+            # 종가가 비어있는(미체결/휴장/미래) 행은 건너뛴다.
+            if r.get("stck_clpr") in (None, "", "0"):
+                continue
             try:
                 rows.append({
                     "date": r["stck_bsop_date"],
@@ -138,7 +141,7 @@ def _fetch_daily_chunk(code: str, start: str, end: str, max_retries: int = 5) ->
                     "close": float(r["stck_clpr"]),
                     "volume": float(r["acml_vol"]),
                 })
-            except (KeyError, ValueError):
+            except (KeyError, ValueError, TypeError):
                 continue
         return rows
     raise KISError(
