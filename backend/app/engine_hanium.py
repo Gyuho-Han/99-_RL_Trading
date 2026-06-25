@@ -113,13 +113,15 @@ def run_experiment(params: Dict, progress_callback: Optional[Callable] = None) -
     net = params.get("net") or "lstm"
     _ensure_registered(algo, net)
 
+    # 프론트에서 빈 값(null)이 오면 .get(key, default) 가 default 대신 None 을 반환하므로
+    # `or default` 로 None/0/빈값을 모두 안전하게 기본값 처리한다.
     episodes = int(params.get("episodes") or params.get("num_epoches") or 50)
     window_size = int(params.get("window_size") or 20)
-    lr = float(params.get("lr", 3e-4))
-    gamma = float(params.get("discount_factor", params.get("gamma", 0.99)))
-    balance = int(params.get("balance", 10_000_000))
-    trade_ratio = float(params.get("trade_ratio", 1.0))
-    batch_size = int(params.get("batch_size", 64))
+    lr = float(params.get("lr") or 3e-4)
+    gamma = float(params.get("discount_factor") or params.get("gamma") or 0.99)
+    balance = int(params.get("balance") or 10_000_000)
+    trade_ratio = float(params.get("trade_ratio") if params.get("trade_ratio") is not None else 1.0)
+    batch_size = int(params.get("batch_size") or 64)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     import datetime as dt
