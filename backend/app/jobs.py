@@ -9,7 +9,7 @@ import threading
 import traceback
 from typing import Dict
 
-from . import engine
+from . import engine, engine_hanium
 
 _jobs: Dict[str, Dict] = {}
 _lock = threading.Lock()
@@ -32,7 +32,9 @@ def _run(job_id: str, params: Dict):
 
     try:
         _set(job_id, status="running", phase="starting", progress=0.0)
-        result = engine.run_experiment(params, progress_callback=cb)
+        # 엔진 선택: 'hanium'(신규 다중 알고리즘) / 'quantylab'(기존, 기본값)
+        eng = engine_hanium if params.get("engine") == "hanium" else engine
+        result = eng.run_experiment(params, progress_callback=cb)
         _set(job_id, status="done", phase="done", progress=1.0, result=result)
     except Exception as e:  # noqa: BLE001
         _set(job_id, status="error", phase="error",

@@ -11,6 +11,7 @@ export const api = {
   health: () => j('/api/health'),
   stocks: () => j('/api/stocks'),
   algorithms: () => j('/api/algorithms'),
+  engines: () => j('/api/engines'),
   features: () => j('/api/features'),
   train: (body) =>
     j('/api/train', {
