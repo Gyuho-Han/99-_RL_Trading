@@ -13,6 +13,7 @@ export const api = {
   algorithms: () => j('/api/algorithms'),
   engines: () => j('/api/engines'),
   features: () => j('/api/features'),
+  models: () => j('/api/models'),
   train: (body) =>
     j('/api/train', {
       method: 'POST',

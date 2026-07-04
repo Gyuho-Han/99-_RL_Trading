@@ -28,6 +28,13 @@ KIS_DOMAIN = (
 # 토큰 캐시 파일 (KIS 는 토큰 발급 호출 빈도 제한이 있어 캐싱 필수)
 TOKEN_CACHE_PATH = BACKEND_DIR / ".kis_token_cache.json"
 
+# OHLCV 로컬 캐시 디렉터리 (반복 실험 시 KIS 재조회 방지)
+OHLCV_CACHE_DIR = BACKEND_DIR / ".ohlcv_cache"
+
+# 학습 완료 모델 저장소 (hanium 엔진 저장/로드)
+MODELS_DIR = BACKEND_DIR / "models"
+HANIUM_MODELS_DIR = MODELS_DIR / "hanium"
+
 # CORS 허용 오리진 (프론트 dev 서버)
 CORS_ORIGINS = os.environ.get(
     "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"

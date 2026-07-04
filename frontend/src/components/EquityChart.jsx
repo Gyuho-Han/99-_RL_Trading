@@ -1,17 +1,18 @@
-import React from 'react'
+import React, { useMemo } from 'react'
 import {
   ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip,
-  CartesianGrid, Legend, ScatterChart, Scatter, ZAxis,
+  CartesianGrid, Legend,
 } from 'recharts'
 
 const fmtDate = (d) => (d ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}` : '')
 
 export default function EquityChart({ series, initial }) {
-  const data = series.dates.map((d, i) => ({
+  // 리렌더마다 배열 재생성 방지
+  const data = useMemo(() => series.dates.map((d, i) => ({
     date: fmtDate(d),
     model: Math.round(series.model_pv[i]),
     buyhold: Math.round(series.buyhold_pv[i]),
-  }))
+  })), [series])
   const n = data.length
   const tickStep = Math.max(1, Math.floor(n / 6))
   return (

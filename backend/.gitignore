@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .env
 .kis_token_cache.json
+.ohlcv_cache/
+models/

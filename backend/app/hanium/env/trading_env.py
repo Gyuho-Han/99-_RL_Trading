@@ -2,7 +2,7 @@
 
 상태: 과거 window_size일의 OHLCV + 기술지표 + 포지션 정보
 행동: 0=매수, 1=매도, 2=관망 (이산)
-보상: 포트폴리오 가치 변화율
+보상: 포트폴리오 가치 변화율 (+선택적 보상 셰이핑: reward_options 참고)
 
 [99-_RL_Trading 이식 사항]
   hanium 원본 환경에 99-(quantylab) 프로토타입의 '거래 현실성'을 이식했다.
@@ -32,7 +32,7 @@ class TradingEnv(gym.Env):
     def __init__(self, df: pd.DataFrame, initial_balance: int = 10_000_000,
                  commission: float = 0.00015, window_size: int = 20,
                  trade_ratio: float = 1.0, raw_prices: np.ndarray = None,
-                 trading_tax: float = 0.0025):
+                 trading_tax: float = 0.0025, reward_options: dict = None):
         """
         Parameters
         ----------
@@ -50,6 +50,12 @@ class TradingEnv(gym.Env):
             정규화 전 원본 종가. None이면 df["close"] 사용.
         trading_tax : float
             매도 시 부과되는 거래세(99- 이식). 기본 0.25%.
+        reward_options : dict, optional
+            보상 셰이핑 계수 (모두 기본 0 = 순수 자산가치 변화율 보상):
+              sell_profit_bonus : 이익 실현 매도 시 실현수익률 × 계수 가산
+              loss_sell_penalty : 손실 매도 시 |실현수익률| × 계수 감산
+              trade_penalty     : 체결(매수/매도) 1회당 고정 감산 (과매매 억제)
+              mdd_penalty       : 낙폭(drawdown) 갱신 시 낙폭 증가분 × 계수 감산
         """
         super().__init__()
         self.df = df
@@ -58,6 +64,12 @@ class TradingEnv(gym.Env):
         self.trading_tax = trading_tax
         self.window_size = window_size
         self.trade_ratio = float(max(0.0, min(1.0, trade_ratio)))
+
+        ro = reward_options or {}
+        self.sell_profit_bonus = float(ro.get("sell_profit_bonus") or 0.0)
+        self.loss_sell_penalty = float(ro.get("loss_sell_penalty") or 0.0)
+        self.trade_penalty = float(ro.get("trade_penalty") or 0.0)
+        self.mdd_penalty = float(ro.get("mdd_penalty") or 0.0)
 
         # 원본 종가 (매매 가격 계산용) — 정규화되지 않은 값
         self.prices = raw_prices if raw_prices is not None else df["close"].values
@@ -93,6 +105,10 @@ class TradingEnv(gym.Env):
         self.trades = []
         self.num_masked = 0
         self._prev_total_asset = self.initial_balance
+        # 보상 셰이핑용 상태
+        self._avg_buy_price = 0.0     # 1주당 매입원가(수수료 포함)
+        self._peak_asset = self.initial_balance
+        self._worst_dd = 0.0          # 지금까지의 최대 낙폭 (음수)
 
         obs = self._get_observation()
         info = self._get_info()
@@ -114,6 +130,8 @@ class TradingEnv(gym.Env):
             self.num_masked += 1
 
         # --- 행동 실행 ---
+        executed_trade = False       # 이번 스텝 체결 여부 (과매매 패널티용)
+        realized_ret = None          # 매도 시 실현수익률 (보너스/패널티용)
         if action == self.BUY and self.shares == 0 and self.balance > 0:
             invest_amount = self.balance * self.trade_ratio
             buy_price = current_price * (1 + self.commission)
@@ -121,6 +139,8 @@ class TradingEnv(gym.Env):
             if self.shares > 0:
                 cost = self.shares * buy_price
                 self.balance -= cost
+                self._avg_buy_price = buy_price
+                executed_trade = True
                 self.trades.append({
                     "step": self.current_step,
                     "action": "buy",
@@ -133,6 +153,9 @@ class TradingEnv(gym.Env):
             sell_price = current_price * (1 - self.commission - self.trading_tax)
             revenue = self.shares * sell_price
             self.balance += revenue
+            if self._avg_buy_price > 0:
+                realized_ret = sell_price / self._avg_buy_price - 1
+            executed_trade = True
             self.trades.append({
                 "step": self.current_step,
                 "action": "sell",
@@ -140,13 +163,30 @@ class TradingEnv(gym.Env):
                 "qty": self.shares,
             })
             self.shares = 0
+            self._avg_buy_price = 0.0
 
         # --- 포트폴리오 가치 계산 ---
         self.total_asset = self.balance + self.shares * current_price
 
-        # --- 보상: 포트폴리오 가치 변화율 ---
+        # --- 보상: 포트폴리오 가치 변화율 + 선택적 셰이핑 ---
         reward = (self.total_asset - self._prev_total_asset) / self._prev_total_asset
         self._prev_total_asset = self.total_asset
+
+        # 1) 실현수익 보너스 / 손실 매도 패널티
+        if realized_ret is not None:
+            if realized_ret > 0:
+                reward += self.sell_profit_bonus * realized_ret
+            else:
+                reward -= self.loss_sell_penalty * abs(realized_ret)
+        # 2) 과매매 패널티 (체결 1회당 고정 감산)
+        if executed_trade:
+            reward -= self.trade_penalty
+        # 3) MDD 패널티 (역대 최대 낙폭을 갱신할 때만 낙폭 증가분에 비례)
+        self._peak_asset = max(self._peak_asset, self.total_asset)
+        dd = (self.total_asset - self._peak_asset) / self._peak_asset
+        if dd < self._worst_dd:
+            reward -= self.mdd_penalty * (self._worst_dd - dd)
+            self._worst_dd = dd
 
         # --- 다음 스텝 ---
         self.current_step += 1

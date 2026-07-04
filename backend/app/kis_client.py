@@ -4,6 +4,11 @@
   - 접근토큰 발급 및 파일 캐싱 (24h 유효, 발급 빈도 제한 회피)
   - 국내주식 기간별 일봉(OHLCV) 조회 (tr_id: FHKST03010100)
     한 번에 약 100영업일까지만 반환되므로 날짜 구간을 나눠 페이지네이션 후 병합한다.
+  - OHLCV 로컬 캐시: 종목별 JSON 파일(backend/.ohlcv_cache/)에 저장하고,
+    캐시에 없는 날짜 구간만 증분 조회한다. 반복 실험 시 KIS 재조회를 제거해
+    fetching 단계가 수 초 → 즉시로 단축된다. '오늘' 일봉은 장중 미확정이므로
+    커버 범위에 포함하지 않아 다음 실행 때 자동 재조회된다.
+    (수정주가 이벤트(액면분할 등) 발생 시 캐시 파일을 삭제하면 전체 재조회)
 
 주의: 시세 조회는 실전/모의 도메인 모두 가능하다. 본 클라이언트는 매매 주문을
 전혀 수행하지 않으며 오직 과거 시세 조회만 한다.
@@ -16,6 +21,9 @@ from typing import List, Dict
 import requests
 
 from . import config
+
+# keep-alive 연결 재사용 (호출마다 TCP/TLS 핸드셰이크 반복 방지)
+_session = requests.Session()
 
 
 class KISError(RuntimeError):
@@ -61,7 +69,7 @@ def get_access_token() -> str:
         "appkey": config.KIS_APP_KEY,
         "appsecret": config.KIS_APP_SECRET,
     }
-    resp = requests.post(url, json=body, timeout=15)
+    resp = _session.post(url, json=body, timeout=15)
     if resp.status_code != 200:
         raise KISError(f"토큰 발급 실패 ({resp.status_code}): {resp.text}")
     data = resp.json()
@@ -109,7 +117,7 @@ def _fetch_daily_chunk(code: str, start: str, end: str, max_retries: int = 5) ->
     }
     last_err = None
     for attempt in range(max_retries):
-        resp = requests.get(url, headers=_headers("FHKST03010100"), params=params, timeout=15)
+        resp = _session.get(url, headers=_headers("FHKST03010100"), params=params, timeout=15)
         try:
             data = resp.json()
         except ValueError:
@@ -162,18 +170,83 @@ def _date_windows(start: str, end: str, days: int = 100):
         cur = w_end + dt.timedelta(days=1)
 
 
-def fetch_ohlcv(code: str, date_from: str, date_to: str) -> List[Dict]:
-    """국내주식 일봉 OHLCV 를 [date_from, date_to] 전체 구간에 대해 조회.
+# ----------------------------------------------------------------------
+# OHLCV 로컬 캐시
+# ----------------------------------------------------------------------
+def _cache_path(code: str):
+    config.OHLCV_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return config.OHLCV_CACHE_DIR / f"{code}.json"
 
-    반환: date 오름차순 정렬된 dict 리스트. date 는 'YYYYMMDD'.
-    KIS 일봉은 호출당 약 100영업일이므로 140달력일 단위로 끊어 호출/병합한다.
-    """
-    code = str(code).zfill(6)
+
+def _load_ohlcv_cache(code: str) -> Dict:
+    try:
+        with open(_cache_path(code), "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("rows"), dict):
+            return data
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return {"covered_from": None, "covered_to": None, "rows": {}}
+
+
+def _save_ohlcv_cache(code: str, cache: Dict) -> None:
+    try:
+        with open(_cache_path(code), "w") as f:
+            json.dump(cache, f)
+    except OSError:
+        pass  # 캐시 저장 실패는 치명적이지 않음 (다음 실행 시 재조회)
+
+
+def _shift_day(yyyymmdd: str, days: int) -> str:
+    d = dt.datetime.strptime(yyyymmdd, "%Y%m%d").date() + dt.timedelta(days=days)
+    return d.strftime("%Y%m%d")
+
+
+def _fetch_range(code: str, date_from: str, date_to: str) -> Dict[str, Dict]:
+    """[date_from, date_to] 구간을 KIS 에서 조회해 {date: row} 로 반환."""
     merged: Dict[str, Dict] = {}
     for w_start, w_end in _date_windows(date_from, date_to, days=140):
         chunk = _fetch_daily_chunk(code, w_start, w_end)
         for row in chunk:
             merged[row["date"]] = row
         time.sleep(0.35)  # 호출 속도 제한 보호 (KIS 초당 제한 회피)
-    rows = sorted(merged.values(), key=lambda r: r["date"])
+    return merged
+
+
+def fetch_ohlcv(code: str, date_from: str, date_to: str) -> List[Dict]:
+    """국내주식 일봉 OHLCV 를 [date_from, date_to] 전체 구간에 대해 조회.
+
+    로컬 캐시를 우선 사용하고, 커버되지 않은 날짜 구간만 KIS 에서 증분 조회한다.
+    반환: date 오름차순 정렬된 dict 리스트. date 는 'YYYYMMDD'.
+    """
+    code = str(code).zfill(6)
+    today = dt.date.today().strftime("%Y%m%d")
+    yesterday = _shift_day(today, -1)
+
+    cache = _load_ohlcv_cache(code)
+    cov_from, cov_to = cache["covered_from"], cache["covered_to"]
+
+    # 캐시에 없는 구간 계산 (앞쪽/뒤쪽 증분)
+    need: List[tuple] = []
+    if cov_from is None:
+        need.append((date_from, date_to))
+    else:
+        if date_from < cov_from:
+            need.append((date_from, _shift_day(cov_from, -1)))
+        if date_to > cov_to:
+            need.append((_shift_day(cov_to, 1), date_to))
+
+    if need:
+        for f_, t_ in need:
+            if f_ > t_:
+                continue
+            cache["rows"].update(_fetch_range(code, f_, t_))
+        # 커버 범위 갱신 — '오늘'은 장중 미확정이라 어제까지만 커버로 기록
+        new_from = min(filter(None, [cov_from, date_from]))
+        new_to = max(filter(None, [cov_to, min(date_to, yesterday)]))
+        cache["covered_from"], cache["covered_to"] = new_from, new_to
+        _save_ohlcv_cache(code, cache)
+
+    rows = [r for d, r in cache["rows"].items() if date_from <= d <= date_to]
+    rows.sort(key=lambda r: r["date"])
     return rows

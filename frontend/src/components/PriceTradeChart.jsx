@@ -1,4 +1,4 @@
-import React from 'react'
+import React, { useMemo } from 'react'
 import {
   ResponsiveContainer, ComposedChart, Line, Scatter, XAxis, YAxis,
   Tooltip, CartesianGrid, Legend,
@@ -7,18 +7,21 @@ import {
 const fmtDate = (d) => (d ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}` : '')
 
 export default function PriceTradeChart({ series, tradeLog }) {
-  const buyByDate = {}
-  const sellByDate = {}
-  for (const t of tradeLog) {
-    if (t.side === 'buy') buyByDate[t.date] = t.price
-    else sellByDate[t.date] = t.price
-  }
-  const data = series.dates.map((d, i) => ({
-    date: fmtDate(d),
-    close: Math.round(series.close[i]),
-    buy: buyByDate[d] != null ? Math.round(buyByDate[d]) : null,
-    sell: sellByDate[d] != null ? Math.round(sellByDate[d]) : null,
-  }))
+  // 리렌더마다 배열 재생성 방지
+  const data = useMemo(() => {
+    const buyByDate = {}
+    const sellByDate = {}
+    for (const t of tradeLog) {
+      if (t.side === 'buy') buyByDate[t.date] = t.price
+      else sellByDate[t.date] = t.price
+    }
+    return series.dates.map((d, i) => ({
+      date: fmtDate(d),
+      close: Math.round(series.close[i]),
+      buy: buyByDate[d] != null ? Math.round(buyByDate[d]) : null,
+      sell: sellByDate[d] != null ? Math.round(sellByDate[d]) : null,
+    }))
+  }, [series, tradeLog])
   const n = data.length
   const tickStep = Math.max(1, Math.floor(n / 6))
   return (

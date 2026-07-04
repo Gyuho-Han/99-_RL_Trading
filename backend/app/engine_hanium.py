@@ -15,34 +15,16 @@ quantylab 엔진과의 차이:
   - 네트워크: DNN/LSTM/CNN 3종 → 8종(Mamba·PatchTST·iTransformer·TFT·xLSTM 포함)
 """
 import importlib
-import math
+import json
+import re
 from typing import Callable, Dict, Optional
 
 import numpy as np
 
-from . import kis_client, features
+from . import kis_client, features, config
+from .metrics import metrics_from_pv, restore_trades, extended_metrics
 
 TRADING_DAYS = 252
-
-
-def _metrics_from_pv(pv: np.ndarray) -> Dict:
-    """포트폴리오 가치 시계열 -> 성과지표(engine.py 와 동일 정의)."""
-    pv = np.asarray(pv, dtype=float)
-    if len(pv) < 2:
-        return dict(cumulative_return=0.0, annual_return=0.0, annual_vol=0.0,
-                    sharpe=0.0, mdd=0.0)
-    initial = pv[0]
-    cum = pv[-1] / initial - 1
-    rets = np.diff(pv) / pv[:-1]
-    ann_vol = float(np.std(rets) * math.sqrt(TRADING_DAYS)) if len(rets) > 1 else 0.0
-    mean_daily = float(np.mean(rets))
-    ann_ret = (1 + cum) ** (TRADING_DAYS / len(pv)) - 1
-    sharpe = (mean_daily / np.std(rets) * math.sqrt(TRADING_DAYS)) if np.std(rets) > 0 else 0.0
-    peak = np.maximum.accumulate(pv)
-    dd = (pv - peak) / peak
-    mdd = float(dd.min())
-    return dict(cumulative_return=float(cum), annual_return=float(ann_ret),
-                annual_vol=ann_vol, sharpe=float(sharpe), mdd=mdd)
 
 # ----------------------------------------------------------------------
 # 알고리즘 / 네트워크 메타데이터 (프론트 선택 UI 용)
@@ -101,8 +83,43 @@ def _net_params_for(net: str, window_size: int) -> Dict:
     return p
 
 
+def list_saved_models() -> list:
+    """저장된 hanium 모델 목록 (metadata.json 기준, 최신순)."""
+    out = []
+    root = config.HANIUM_MODELS_DIR
+    if not root.is_dir():
+        return out
+    for d in root.iterdir():
+        meta_p = d / "metadata.json"
+        if d.is_dir() and meta_p.exists():
+            try:
+                with open(meta_p, encoding="utf-8") as f:
+                    meta = json.load(f)
+                meta["model_id"] = d.name
+                out.append(meta)
+            except (json.JSONDecodeError, OSError):
+                continue
+    out.sort(key=lambda m: m.get("created_at", ""), reverse=True)
+    return out
+
+
+def _load_model_meta(model_id: str) -> Dict:
+    """저장 모델 metadata 로드. model_id 는 디렉터리명 (경로 조작 방지 검증)."""
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", model_id or ""):
+        raise ValueError(f"잘못된 모델 id: {model_id}")
+    meta_p = config.HANIUM_MODELS_DIR / model_id / "metadata.json"
+    if not meta_p.exists():
+        raise ValueError(f"저장된 모델을 찾을 수 없습니다: {model_id}")
+    with open(meta_p, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def run_experiment(params: Dict, progress_callback: Optional[Callable] = None) -> Dict:
-    """단일 실험(학습+백테스트) 실행. 결과 dict 는 engine.run_experiment 와 동일 형태."""
+    """단일 실험(학습+백테스트) 실행. 결과 dict 는 engine.run_experiment 와 동일 형태.
+
+    saved_model 파라미터가 주어지면 학습을 건너뛰고 저장된 체크포인트를 로드해
+    백테스트만 수행한다(알고리즘·네트워크·window·지표는 저장 시점 설정으로 강제).
+    """
     import torch  # 지연 임포트(서버 기동 부담 완화)
     from .hanium.agents.registry import AgentRegistry
     from .hanium.networks.registry import NetworkRegistry
@@ -111,6 +128,17 @@ def run_experiment(params: Dict, progress_callback: Optional[Callable] = None) -
     code = str(params["stock_code"]).zfill(6)
     algo = params["algorithm"]
     net = params.get("net") or "lstm"
+
+    # ---- 저장 모델 재사용: 저장 시점 설정으로 덮어쓰기 (입력 차원 일치 필수) ----
+    saved_model = (params.get("saved_model") or "").strip() or None
+    saved_meta = None
+    if saved_model:
+        saved_meta = _load_model_meta(saved_model)
+        algo = saved_meta["algorithm"]
+        net = saved_meta["net"]
+        params = dict(params)
+        params["features"] = saved_meta.get("features")
+
     _ensure_registered(algo, net)
 
     # 프론트에서 빈 값(null)이 오면 .get(key, default) 가 default 대신 None 을 반환하므로
@@ -122,7 +150,13 @@ def run_experiment(params: Dict, progress_callback: Optional[Callable] = None) -
     balance = int(params.get("balance") or 10_000_000)
     trade_ratio = float(params.get("trade_ratio") if params.get("trade_ratio") is not None else 1.0)
     batch_size = int(params.get("batch_size") or 64)
+    # 보상 셰이핑 옵션 (실현수익 보너스·손실매도/과매매/MDD 패널티, 기본 0 = 기존과 동일)
+    reward_options = dict(params.get("reward_options") or {})
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if saved_meta is not None:
+        window_size = int(saved_meta["window_size"])
+        trade_ratio = float(saved_meta.get("trade_ratio", trade_ratio))
 
     import datetime as dt
     train_start = params["train_start"].replace("-", "")
@@ -160,9 +194,11 @@ def run_experiment(params: Dict, progress_callback: Optional[Callable] = None) -
     price_te = chart_te["close"].astype(float).values
 
     # ---- 환경 ----
+    # 보상 셰이핑은 학습 환경에만 적용 (테스트는 탐욕 정책이라 보상이 결과에 무관)
     env_tr = TradingEnv(df=df_tr, initial_balance=balance, commission=0.00015,
                         window_size=window_size, trade_ratio=trade_ratio,
-                        raw_prices=price_tr, trading_tax=0.0025)
+                        raw_prices=price_tr, trading_tax=0.0025,
+                        reward_options=reward_options)
     env_te = TradingEnv(df=df_te, initial_balance=balance, commission=0.00015,
                         window_size=window_size, trade_ratio=trade_ratio,
                         raw_prices=price_te, trading_tax=0.0025)
@@ -178,22 +214,29 @@ def run_experiment(params: Dict, progress_callback: Optional[Callable] = None) -
         batch_size=batch_size, num_actions=env_tr.action_space.n,
     )
 
-    # ---- 학습 ----
-    for ep in range(1, episodes + 1):
-        state, _ = env_tr.reset()
-        done = False
-        while not done:
-            action = agent.select_action(state, explore=True)
-            next_state, reward, terminated, truncated, info = env_tr.step(action)
-            agent.store_transition(state, action, reward, next_state, terminated)
-            agent.train_step()
-            state = next_state
-            done = terminated or truncated
-        agent.on_episode_end(ep)
-        if progress_callback:
-            progress_callback("training", ep, episodes,
-                              float(info["total_asset"]),
-                              float(info["profit_pct"]))
+    # ---- 학습 (저장 모델 재사용 시 건너뜀) ----
+    if saved_meta is None:
+        for ep in range(1, episodes + 1):
+            state, _ = env_tr.reset()
+            done = False
+            while not done:
+                action = agent.select_action(state, explore=True)
+                next_state, reward, terminated, truncated, info = env_tr.step(action)
+                agent.store_transition(state, action, reward, next_state, terminated)
+                agent.train_step()
+                state = next_state
+                done = terminated or truncated
+            agent.on_episode_end(ep)
+            if progress_callback:
+                progress_callback("training", ep, episodes,
+                                  float(info["total_asset"]),
+                                  float(info["profit_pct"]))
+        # 학습 완료 모델 체크포인트 저장 (metadata 는 백테스트 지표 계산 후 저장)
+        model_id = f"{code}_{algo}_{net}_{dt.datetime.now():%Y%m%d_%H%M%S}"
+        agent.save(config.HANIUM_MODELS_DIR / model_id / "checkpoint.pt")
+    else:
+        model_id = saved_model
+        agent.load(config.HANIUM_MODELS_DIR / saved_model / "checkpoint.pt")
 
     # ---- 백테스트 (탐험 0) ----
     if progress_callback:
@@ -225,51 +268,41 @@ def run_experiment(params: Dict, progress_callback: Optional[Callable] = None) -
     else:
         bh_pv = []
 
-    # ---- 체결 내역 복원 (보유주식 수 변화 기반) + 매도별 실현손익 ----
-    CHARGE = 0.00015
-    TAX = 0.0025
-    trades_log = []
-    prev_shares = 0
-    avg_cost = 0.0
-    total_traded_amount = 0.0
-    total_realized_profit = 0.0
-    for i in range(n):
-        shares = int(num_stocks[i])
-        price = float(closes[i])
-        delta = shares - prev_shares
-        if delta > 0:  # 매수
-            qty = delta
-            buy_cost_per = price * (1 + CHARGE)
-            avg_cost = (avg_cost * prev_shares + buy_cost_per * qty) / (prev_shares + qty)
-            amount = qty * price
-            total_traded_amount += amount
-            trades_log.append({
-                "date": dates[i], "side": "buy", "shares": qty, "price": price,
-                "amount": amount, "holding_after": shares,
-            })
-        elif delta < 0:  # 매도
-            qty = -delta
-            proceeds_per = price * (1 - CHARGE - TAX)
-            profit = (proceeds_per - avg_cost) * qty
-            ret = (proceeds_per / avg_cost - 1) if avg_cost > 0 else 0.0
-            amount = qty * price
-            total_traded_amount += amount
-            total_realized_profit += profit
-            trades_log.append({
-                "date": dates[i], "side": "sell", "shares": qty, "price": price,
-                "amount": amount, "profit": float(profit), "return": float(ret),
-                "avg_cost": float(avg_cost), "holding_after": shares,
-            })
-        prev_shares = shares
-
+    # ---- 체결 내역 복원 + 성과지표 (공용 metrics 모듈) ----
+    trades_log, trade_summary = restore_trades(dates, closes, num_stocks,
+                                               charge=0.00015, tax=0.0025)
     num_buy = sum(1 for t in trades_log if t["side"] == "buy")
     num_sell = sum(1 for t in trades_log if t["side"] == "sell")
     num_hold = n - num_buy - num_sell
 
-    model_metrics = _metrics_from_pv(np.array(model_pv))
-    bh_metrics = _metrics_from_pv(np.array(bh_pv))
+    model_metrics = metrics_from_pv(np.array(model_pv))
+    model_metrics.update(extended_metrics(trades_log, dates, model_pv))
+    bh_metrics = metrics_from_pv(np.array(bh_pv))
+    bh_metrics.update(extended_metrics([], dates, bh_pv))
+
+    # ---- 새로 학습한 모델이면 metadata 저장 (저장 모델 목록 API 용) ----
+    if saved_meta is None:
+        meta = {
+            "model_id": model_id, "engine": "hanium", "stock_code": code,
+            "algorithm": algo, "net": net, "window_size": window_size,
+            "trade_ratio": trade_ratio, "features": feat_cols,
+            "episodes": episodes, "lr": lr, "gamma": gamma,
+            "train_period": [train_start, train_end],
+            "test_period": [test_start, test_end],
+            "reward_options": reward_options,
+            "created_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "metrics": {"model": model_metrics, "buyhold": bh_metrics},
+        }
+        try:
+            with open(config.HANIUM_MODELS_DIR / model_id / "metadata.json",
+                      "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass  # metadata 저장 실패는 결과 반환을 막지 않음
 
     return {
+        "model_id": model_id,
+        "saved_model_used": saved_meta is not None,
         "engine": "hanium",
         "stock_code": code,
         "algorithm": algo,
@@ -292,11 +325,7 @@ def run_experiment(params: Dict, progress_callback: Optional[Callable] = None) -
             "num_stocks": [int(x) for x in num_stocks],
         },
         "trade_log": trades_log,
-        "trade_summary": {
-            "total_traded_amount": float(total_traded_amount),
-            "total_realized_profit": float(total_realized_profit),
-            "num_trades": len(trades_log),
-        },
+        "trade_summary": trade_summary,
         "metrics": {"model": model_metrics, "buyhold": bh_metrics},
         "initial_balance": balance,
     }

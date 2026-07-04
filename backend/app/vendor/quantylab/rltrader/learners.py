@@ -408,6 +408,298 @@ class DQNLearner(ReinforcementLearner):
         return x, y_value, None
 
 
+class DQNPlusLearner(DQNLearner):
+    """DQN 한계 극복 기법(고려대 오승상 교수 DRL 강의자료)을 선택 적용하는 확장 DQN.
+
+    dqn_options (dict) — 체크박스 단위로 개별 on/off:
+      td:        1-step TD 학습 (강의 p.51-62, 68). 스텝 보상(포트폴리오 가치 변화율)
+                 + 부트스트랩 타깃 r + γ·maxQ(s'). False 면 기존 quantylab 방식
+                 (에피소드 종료 후 '최종손익-현재손익' MC 회귀) 그대로 동작.
+      replay:    Experience Replay (p.70-71). 전이를 버퍼에 쌓고 랜덤 미니배치로
+                 학습해 시계열 상관성을 제거. [td 필요]
+      target:    Target Network (p.72-74). 타깃 계산 전용 고정 네트워크를 두고
+                 주기적으로 하드 업데이트해 moving target 문제 완화. [td 필요]
+      double:    Double DQN (p.77). 행동 선택은 온라인망, 평가는 타깃망으로 분리해
+                 max 연산의 Q 과대평가 완화. [target 필요]
+      multistep: Multi-step Learning (p.76). n-스텝 리턴으로 보상 전파 가속. [td 필요]
+      n_step:    multistep 의 n (기본 3).
+      per:       Prioritized Experience Replay (p.78-81). |TD 오차| 비례 샘플링
+                 + β-어닐링 importance sampling 가중치. [replay 필요]
+      dueling:   Dueling DQN (p.82-85). V(s)+A(s,a) 이중 스트림 헤드. [독립 적용 가능]
+
+    기존 quantylab DQN 에 TD 가 없던 이유: memory_reward 에 '누적 손익률'이 저장되고
+    get_batch 가 (최종 손익 - 현재 손익)을 보상으로 쓰기 때문에 1-step 보상이 존재하지
+    않으며, 학습도 에포크 종료 후 한 번뿐이라 부트스트랩 기반 TD 갱신이 불가능했다.
+    본 클래스는 스텝 보상을 직접 계산해 표준 Q-learning 형태로 재구성한다.
+    """
+
+    REWARD_SCALE = 100.0   # 손익률(비율) → % 단위로 스케일링 (MSE 그래디언트 안정화)
+
+    # TD 학습 하이퍼파라미터 (프로토타입 데이터 규모에 맞춘 기본값)
+    BUFFER_CAP = 100_000
+    BATCH_SIZE = 64
+    TRAIN_FREQ_REPLAY = 4      # replay 사용 시: 4스텝마다 랜덤 미니배치 1회
+    SEQ_BATCH = 32             # replay 미사용 시: 32스텝 순차(상관) 배치로 학습
+    WARMUP = 200               # 학습 시작 전 버퍼 최소 크기
+    TARGET_UPDATE_FREQ = 200   # 타깃망 하드 업데이트 주기(스텝)
+    PER_ALPHA = 0.6
+    PER_BETA0 = 0.4
+    PER_EPS = 1e-3
+
+    def __init__(self, *args, dqn_options=None, **kwargs):
+        self.dqn_options = self.normalize_options(dqn_options)
+        self.target_network = None
+        super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def normalize_options(o):
+        """체크박스 값의 의존성 정리: replay/target/multistep ⊂ td, double ⊂ target, per ⊂ replay."""
+        o = dict(o or {})
+        td = bool(o.get("td"))
+        replay = td and bool(o.get("replay"))
+        target = td and bool(o.get("target"))
+        return {
+            "td": td,
+            "replay": replay,
+            "target": target,
+            "double": target and bool(o.get("double")),
+            "multistep": td and bool(o.get("multistep")),
+            "n_step": max(2, min(int(o.get("n_step") or 3), 10)),
+            "per": replay and bool(o.get("per")),
+            "dueling": bool(o.get("dueling")),
+        }
+
+    def init_value_network(self, shared_network=None, activation='linear', loss='mse'):
+        dueling = self.dqn_options.get("dueling", False)
+
+        def build():
+            common = dict(input_dim=self.num_features,
+                          output_dim=self.agent.NUM_ACTIONS,
+                          lr=self.lr, shared_network=shared_network,
+                          activation=activation, loss=loss, dueling=dueling)
+            if self.net == 'dnn':
+                return DNN(**common)
+            if self.net == 'lstm':
+                return LSTMNetwork(num_steps=self.num_steps, **common)
+            if self.net == 'cnn':
+                return CNN(num_steps=self.num_steps, **common)
+            raise ValueError(f'지원하지 않는 네트워크: {self.net}')
+
+        self.value_network = build()
+        if self.reuse_models and os.path.exists(self.value_network_path):
+            self.value_network.load_model(model_path=self.value_network_path)
+        if self.dqn_options.get("target"):
+            self.target_network = build()
+            self.target_network.copy_weights_from(self.value_network)
+
+    def run(self, learning=True, progress_callback=None):
+        # TD 미적용 시 기존 quantylab 방식(에포크 종료 후 MC 회귀)으로 그대로 학습.
+        # (dueling 체크는 네트워크 구조라 이 경로에서도 적용된 상태)
+        if not self.dqn_options.get("td"):
+            return super().run(learning=learning, progress_callback=progress_callback)
+        return self._run_td(learning=learning, progress_callback=progress_callback)
+
+    # ------------------------------------------------------------------
+    # TD 기반 학습 루프 (step 단위 Q-learning)
+    # ------------------------------------------------------------------
+    def _run_td(self, learning=True, progress_callback=None):
+        if progress_callback is not None:
+            self.progress_callback = progress_callback
+        o = self.dqn_options
+        gamma = self.discount_factor
+        n_step = o["n_step"] if o["multistep"] else 1
+        use_replay, use_target = o["replay"], o["target"]
+        use_double, use_per = o["double"], o["per"]
+
+        enabled = [k for k in ("td", "replay", "target", "double",
+                               "multistep", "per", "dueling") if o.get(k)]
+        info = (f'[{self.stock_code}] RL:dqn+({",".join(enabled)}) NET:{self.net} '
+                f'LR:{self.lr} DF:{gamma}')
+        with self.lock:
+            logger.debug(info)
+
+        time_start = time.time()
+
+        # 리플레이 버퍼 (링 버퍼) / PER 우선순위
+        buffer, prios = [], []
+        ring_idx = 0
+        seq_batch = []      # replay 미사용 시 순차 전이 누적
+        global_step = 0
+        total_steps_est = max(1, self.num_epoches * max(1, len(self.training_data)))
+
+        def store_transition(tr):
+            nonlocal ring_idx
+            if use_replay:
+                p = max(prios) if (use_per and prios) else 1.0
+                if len(buffer) < self.BUFFER_CAP:
+                    buffer.append(tr)
+                    prios.append(p)
+                else:
+                    buffer[ring_idx] = tr
+                    prios[ring_idx] = p
+                    ring_idx = (ring_idx + 1) % self.BUFFER_CAP
+            else:
+                seq_batch.append(tr)
+
+        def train_batch(transitions, idxs=None, weights=None):
+            """전이 배치로 Q 갱신. 타깃: G + γ^n · (max 또는 double) Q(s')·(1-done)"""
+            b = len(transitions)
+            x = np.asarray([t[0] for t in transitions], dtype=np.float32)
+            a = np.asarray([t[1] for t in transitions], dtype=np.int64)
+            g = np.asarray([t[2] for t in transitions], dtype=np.float32)
+            x2 = np.asarray([t[3] for t in transitions], dtype=np.float32)
+            d = np.asarray([t[4] for t in transitions], dtype=np.float32)
+            disc = np.asarray([t[5] for t in transitions], dtype=np.float32)
+
+            q_now = self.value_network.predict_on_batch(x)
+            net_next = self.target_network if use_target else self.value_network
+            q_next = net_next.predict_on_batch(x2)
+            if use_double:
+                # Double DQN: 온라인망으로 a* 선택, 타깃망으로 평가
+                a_star = np.argmax(self.value_network.predict_on_batch(x2), axis=1)
+                boot = q_next[np.arange(b), a_star]
+            else:
+                boot = q_next.max(axis=1)
+            target = g + disc * boot * (1.0 - d)
+            td_err = target - q_now[np.arange(b), a]
+            y = q_now.copy()
+            y[np.arange(b), a] = target
+            loss = self.value_network.train_on_batch(x, y, weights=weights)
+            if use_per and idxs is not None:
+                for bi, err in zip(idxs, np.abs(td_err)):
+                    prios[bi] = float(err) + self.PER_EPS
+            return loss
+
+        max_portfolio_value = 0
+        epoch_win_cnt = 0
+
+        for epoch in tqdm(range(self.num_epoches)):
+            time_start_epoch = time.time()
+            q_sample = collections.deque(maxlen=self.num_steps)
+            self.reset()
+
+            if learning and self.num_epoches > 1:
+                epsilon = self.start_epsilon * (1 - (epoch / (self.num_epoches - 1)))
+            else:
+                epsilon = self.start_epsilon
+
+            prev_pl = 0.0
+            nstep_q = collections.deque()   # (state, action, step_reward)
+            losses = []
+
+            for i in tqdm(range(len(self.training_data)), leave=False):
+                next_sample = self.build_sample()
+                if next_sample is None:
+                    break
+                q_sample.append(next_sample)
+                if len(q_sample) < self.num_steps:
+                    continue
+
+                state = [list(s) for s in q_sample]
+
+                # 새 상태 s_{t+n} 도착 → 가장 오래된 전이 (s_t, a_t) 완성
+                if learning and len(nstep_q) >= n_step:
+                    g = sum((gamma ** k) * nstep_q[k][2] for k in range(n_step))
+                    s0, a0, _ = nstep_q.popleft()
+                    store_transition((s0, a0, g, state, 0.0, gamma ** n_step))
+
+                # 행동 결정 및 실행
+                pred_value = self.value_network.predict(list(q_sample))
+                action, confidence, exploration = \
+                    self.agent.decide_action(pred_value, None, epsilon)
+                reward = self.agent.act(action, confidence)
+
+                # 1-step TD 보상: 포트폴리오 가치 변화율(스텝 손익 증분)
+                step_reward = (reward - prev_pl) * self.REWARD_SCALE
+                prev_pl = reward
+                nstep_q.append((state, action, step_reward))
+
+                # 메모리 (백테스트 결과 수집·가시화 호환용 — 기존 형식 유지)
+                self.memory_sample.append(list(q_sample))
+                self.memory_action.append(action)
+                self.memory_reward.append(reward)
+                self.memory_value.append(pred_value)
+                self.memory_pv.append(self.agent.portfolio_value)
+                self.memory_num_stocks.append(self.agent.num_stocks)
+                if exploration:
+                    self.memory_exp_idx.append(self.training_data_idx)
+                self.batch_size += 1
+                self.itr_cnt += 1
+                self.exploration_cnt += 1 if exploration else 0
+                global_step += 1
+
+                # ---- 학습 ----
+                if learning:
+                    if use_replay:
+                        if (len(buffer) >= max(self.WARMUP, self.BATCH_SIZE)
+                                and global_step % self.TRAIN_FREQ_REPLAY == 0):
+                            n = len(buffer)
+                            if use_per:
+                                p = np.asarray(prios, dtype=np.float64) ** self.PER_ALPHA
+                                prob = p / p.sum()
+                                idxs = np.random.choice(n, self.BATCH_SIZE, p=prob)
+                                beta = self.PER_BETA0 + (1.0 - self.PER_BETA0) * min(
+                                    1.0, global_step / total_steps_est)
+                                w = (n * prob[idxs]) ** (-beta)
+                                w = (w / w.max()).astype(np.float32)
+                            else:
+                                idxs = np.random.randint(0, n, self.BATCH_SIZE)
+                                w = None
+                            losses.append(train_batch(
+                                [buffer[j] for j in idxs], idxs, w))
+                    else:
+                        # replay 미사용: 순차(상관) 배치 — 강의자료가 지적한
+                        # correlated samples 문제를 그대로 보여주는 대조군
+                        if len(seq_batch) >= self.SEQ_BATCH:
+                            losses.append(train_batch(seq_batch))
+                            seq_batch.clear()
+
+                    # 타깃 네트워크 하드 업데이트
+                    if use_target and global_step % self.TARGET_UPDATE_FREQ == 0:
+                        self.target_network.copy_weights_from(self.value_network)
+
+            # ---- 에피소드 종료: 잔여 n-step 전이 done=True 로 플러시 ----
+            if learning:
+                last_state = [list(s) for s in q_sample] if len(q_sample) == self.num_steps else None
+                while nstep_q and last_state is not None:
+                    k_len = len(nstep_q)
+                    g = sum((gamma ** k) * nstep_q[k][2] for k in range(k_len))
+                    s0, a0, _ = nstep_q.popleft()
+                    store_transition((s0, a0, g, last_state, 1.0, gamma ** k_len))
+                if not use_replay and len(seq_batch) >= 4:
+                    losses.append(train_batch(seq_batch))
+                    seq_batch.clear()
+
+            self.loss = float(np.mean(losses)) if losses else 0.0
+
+            # 에포크 로그 (기존 형식 유지)
+            num_epoches_digit = len(str(self.num_epoches))
+            epoch_str = str(epoch + 1).rjust(num_epoches_digit, '0')
+            elapsed_time_epoch = time.time() - time_start_epoch
+            logger.debug(f'[{self.stock_code}][Epoch {epoch_str}/{self.num_epoches}] '
+                f'Epsilon:{epsilon:.4f} #Expl.:{self.exploration_cnt}/{self.itr_cnt} '
+                f'#Buy:{self.agent.num_buy} #Sell:{self.agent.num_sell} #Hold:{self.agent.num_hold} '
+                f'#Stocks:{self.agent.num_stocks} PV:{self.agent.portfolio_value:,.0f} '
+                f'Loss:{self.loss:.6f} ET:{elapsed_time_epoch:.4f}')
+
+            if self.progress_callback is not None:
+                try:
+                    self.progress_callback(epoch + 1, self.num_epoches,
+                                           float(self.agent.portfolio_value),
+                                           float(self.agent.profitloss))
+                except Exception:
+                    pass
+
+            max_portfolio_value = max(max_portfolio_value, self.agent.portfolio_value)
+            if self.agent.portfolio_value > self.agent.initial_balance:
+                epoch_win_cnt += 1
+
+        elapsed_time = time.time() - time_start
+        with self.lock:
+            logger.debug(f'[{self.stock_code}] Elapsed Time:{elapsed_time:.4f} '
+                f'Max PV:{max_portfolio_value:,.0f} #Win:{epoch_win_cnt}')
+
+
 class PolicyGradientLearner(ReinforcementLearner):
     def __init__(self, *args, policy_network_path=None, **kwargs):
         super().__init__(*args, **kwargs)
