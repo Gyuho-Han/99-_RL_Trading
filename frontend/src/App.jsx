@@ -17,6 +17,18 @@ const PHASE_LABEL = {
   training: '학습 중', backtesting: '백테스트 중', done: '완료', error: '오류',
 }
 
+// DQN 한계 극복 기법 (고려대 오승상 교수 DRL 강의자료 기준)
+// requires: 해당 기법의 전제조건 체크박스 id
+const DQN_IMPROVEMENTS = [
+  { id: 'td', label: 'TD 학습', sub: '1-step TD 타깃 r+γ·maxQ(s′). 기존 MC 방식 대체 · 아래 기법들의 기반', requires: null },
+  { id: 'replay', label: 'Experience Replay', sub: '리플레이 버퍼 + 랜덤 미니배치로 샘플 상관성 제거', requires: 'td' },
+  { id: 'target', label: 'Target Network', sub: '타깃 전용 고정 네트워크 (주기적 동기화)로 학습 안정화', requires: 'td' },
+  { id: 'double', label: 'Double DQN', sub: '선택은 온라인망·평가는 타깃망 → Q 과대평가 완화', requires: 'target' },
+  { id: 'multistep', label: 'Multi-step (n=3)', sub: 'n-스텝 리턴으로 보상 전파 가속', requires: 'td' },
+  { id: 'per', label: 'Prioritized Replay', sub: '|TD 오차| 비례 우선 샘플링 + IS 가중 보정', requires: 'replay' },
+  { id: 'dueling', label: 'Dueling DQN', sub: 'V(s)+A(s,a) 이중 스트림 헤드 (독립 적용 가능)', requires: null },
+]
+
 export default function App() {
   const [stocks, setStocks] = useState([])
   const [algos, setAlgos] = useState([])
@@ -40,6 +52,20 @@ export default function App() {
   const [featureMeta, setFeatureMeta] = useState([])
   const [selectedFeatures, setSelectedFeatures] = useState([])
 
+  // DQN 개선 기법 체크박스 (기본: 2015 Nature DQN 구성 = TD + Replay + Target)
+  const [dqnOpts, setDqnOpts] = useState({
+    td: true, replay: true, target: true,
+    double: false, multistep: false, per: false, dueling: false,
+  })
+
+  // hanium: 매수 비율 · 보상 셰이핑 · 저장 모델 재사용
+  const [tradeRatio, setTradeRatio] = useState(1.0)
+  const [rewardOpts, setRewardOpts] = useState({
+    sell_profit_bonus: 0, loss_sell_penalty: 0, trade_penalty: 0, mdd_penalty: 0,
+  })
+  const [savedModels, setSavedModels] = useState([])
+  const [savedModel, setSavedModel] = useState('')   // '' = 새로 학습
+
   const [job, setJob] = useState(null)
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
@@ -54,6 +80,7 @@ export default function App() {
       setFeatureMeta(fs)
       setSelectedFeatures(fs.map((f) => f.id)) // 기본값: 전체 선택
     }).catch(() => {})
+    api.models().then(setSavedModels).catch(() => {})
   }, [])
 
   // 현재 엔진의 알고리즘/네트워크 목록 (엔진 메타 로드 전엔 기본값)
@@ -78,6 +105,21 @@ export default function App() {
       prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id])
   }
 
+  // DQN 개선 기법 토글 + 의존성 자동 정리 (td 해제 → 하위 기법 전부 해제 등)
+  function toggleDqnOpt(id) {
+    setDqnOpts((prev) => {
+      const next = { ...prev, [id]: !prev[id] }
+      if (!next.td) {
+        next.replay = false; next.target = false; next.double = false
+        next.multistep = false; next.per = false
+      }
+      if (!next.replay) next.per = false
+      if (!next.target) next.double = false
+      return next
+    })
+  }
+  const showDqnOpts = engine === 'quantylab' && algo === 'dqn'
+
   // group -> [feature, ...] 로 묶기 (메타 순서 유지)
   const featureGroups = featureMeta.reduce((acc, f) => {
     (acc[f.group] = acc[f.group] || []).push(f)
@@ -91,6 +133,7 @@ export default function App() {
   async function start() {
     setError(null)
     setResult(null)
+    clearInterval(pollRef.current)   // 이전 폴링 잔여분 정리
     try {
       const body = {
         stock_code: stock, engine, algorithm: algo, net,
@@ -101,8 +144,17 @@ export default function App() {
       if (engine === 'hanium') {
         body.episodes = Number(epochs)
         body.window_size = Number(windowSize)
+        body.trade_ratio = Number(tradeRatio)
+        body.reward_options = {
+          sell_profit_bonus: Number(rewardOpts.sell_profit_bonus) || 0,
+          loss_sell_penalty: Number(rewardOpts.loss_sell_penalty) || 0,
+          trade_penalty: Number(rewardOpts.trade_penalty) || 0,
+          mdd_penalty: Number(rewardOpts.mdd_penalty) || 0,
+        }
+        if (savedModel) body.saved_model = savedModel
       } else {
         body.num_epoches = Number(epochs)
+        if (algo === 'dqn') body.dqn_options = dqnOpts
       }
       const { job_id } = await api.train(body)
       setJob({ status: 'queued', phase: 'queued', progress: 0 })
@@ -113,6 +165,8 @@ export default function App() {
           if (j.status === 'done') {
             clearInterval(pollRef.current)
             setResult(j.result)
+            // 새 모델이 저장됐을 수 있으므로 목록 갱신
+            if (engine === 'hanium') api.models().then(setSavedModels).catch(() => {})
           } else if (j.status === 'error') {
             clearInterval(pollRef.current)
             setError(j.error || '학습 중 오류가 발생했습니다.')
@@ -197,10 +251,66 @@ export default function App() {
           ))}
         </div>
         {engine === 'hanium' && (
-          <p className="note" style={{ marginTop: 10 }}>
-            hanium 엔진은 알고리즘 10종 × 네트워크 8종을 자유롭게 조합해 실험할 수 있습니다.
-            (거래세 0.25% · 수수료 · 액션 마스킹이 환경에 이식되어 있습니다.)
-          </p>
+          <>
+            <p className="note" style={{ marginTop: 10 }}>
+              hanium 엔진은 알고리즘 10종 × 네트워크 8종을 자유롭게 조합해 실험할 수 있습니다.
+              (거래세 0.25% · 수수료 · 액션 마스킹이 환경에 이식되어 있습니다.)
+            </p>
+            <div className="feat-group-title" style={{ marginTop: 14 }}>
+              저장된 학습 모델 재사용 ({savedModels.length}개 저장됨)
+            </div>
+            <select value={savedModel}
+              onChange={(e) => setSavedModel(e.target.value)}
+              style={{ width: '100%', padding: '8px 10px', marginTop: 6,
+                       background: '#1e222b', color: '#e6e9ef',
+                       border: '1px solid #2a2f3a', borderRadius: 8 }}>
+              <option value="">새로 학습 (학습 완료 후 자동 저장)</option>
+              {savedModels.map((m) => (
+                <option key={m.model_id} value={m.model_id}>
+                  {m.model_id}
+                  {m.metrics?.model != null
+                    ? ` — 수익률 ${(m.metrics.model.cumulative_return * 100).toFixed(1)}% · MDD ${(m.metrics.model.mdd * 100).toFixed(1)}%`
+                    : ''}
+                </option>
+              ))}
+            </select>
+            {savedModel && (
+              <p className="note" style={{ marginTop: 8 }}>
+                저장 모델 재사용: 학습을 건너뛰고 백테스트만 수행합니다.
+                알고리즘·네트워크·State 지표·윈도우는 저장 시점 설정으로 자동 적용됩니다.
+              </p>
+            )}
+          </>
+        )}
+        {showDqnOpts && (
+          <>
+            <div className="feat-group-title" style={{ marginTop: 14 }}>
+              DQN 개선 기법 ({Object.values(dqnOpts).filter(Boolean).length}개 적용) — 강의자료 기반
+            </div>
+            <div className="feat-list">
+              {DQN_IMPROVEMENTS.map((imp) => {
+                const blocked = imp.requires && !dqnOpts[imp.requires]
+                return (
+                  <label key={imp.id}
+                    className={`feat-chip ${dqnOpts[imp.id] ? 'on' : ''}`}
+                    style={blocked ? { opacity: 0.4, cursor: 'not-allowed' } : undefined}
+                    title={imp.sub + (imp.requires ? ` (요구: ${
+                      DQN_IMPROVEMENTS.find((x) => x.id === imp.requires)?.label})` : '')}>
+                    <input type="checkbox"
+                      checked={dqnOpts[imp.id]}
+                      disabled={blocked}
+                      onChange={() => toggleDqnOpt(imp.id)} />
+                    {imp.label}
+                  </label>
+                )
+              })}
+            </div>
+            <p className="note" style={{ marginTop: 8 }}>
+              {dqnOpts.td
+                ? '체크된 기법이 적용된 step 단위 Q-learning 으로 학습합니다. Double은 Target, Prioritized는 Replay가 먼저 필요합니다.'
+                : 'TD 학습을 끄면 기존 방식(에포크 종료 후 누적수익 회귀)으로 학습하며 Replay·Target 등은 적용되지 않습니다. (Dueling은 구조 옵션이라 단독 적용 가능)'}
+            </p>
+          </>
         )}
       </div>
 
@@ -272,9 +382,26 @@ export default function App() {
               <input type="number" step="0.0001" value={lr}
                 onChange={(e) => setLr(e.target.value)} /></div>
             {engine === 'hanium' && (
-              <div className="field"><label>관측 윈도우 (window_size, 일)</label>
-                <input type="number" min="5" max="120" value={windowSize}
-                  onChange={(e) => setWindowSize(e.target.value)} /></div>
+              <>
+                <div className="field"><label>관측 윈도우 (window_size, 일)</label>
+                  <input type="number" min="5" max="120" value={windowSize}
+                    onChange={(e) => setWindowSize(e.target.value)} /></div>
+                <div className="field"><label>매수 비율 (trade_ratio, 0~1)</label>
+                  <input type="number" step="0.1" min="0.1" max="1" value={tradeRatio}
+                    onChange={(e) => setTradeRatio(e.target.value)} /></div>
+                <div className="field"><label>실현수익 보너스 계수</label>
+                  <input type="number" step="0.1" min="0" value={rewardOpts.sell_profit_bonus}
+                    onChange={(e) => setRewardOpts({ ...rewardOpts, sell_profit_bonus: e.target.value })} /></div>
+                <div className="field"><label>손실매도 패널티 계수</label>
+                  <input type="number" step="0.1" min="0" value={rewardOpts.loss_sell_penalty}
+                    onChange={(e) => setRewardOpts({ ...rewardOpts, loss_sell_penalty: e.target.value })} /></div>
+                <div className="field"><label>거래 패널티 (체결당, 예: 0.0005)</label>
+                  <input type="number" step="0.0001" min="0" value={rewardOpts.trade_penalty}
+                    onChange={(e) => setRewardOpts({ ...rewardOpts, trade_penalty: e.target.value })} /></div>
+                <div className="field"><label>MDD 패널티 계수 (예: 0.3)</label>
+                  <input type="number" step="0.1" min="0" value={rewardOpts.mdd_penalty}
+                    onChange={(e) => setRewardOpts({ ...rewardOpts, mdd_penalty: e.target.value })} /></div>
+              </>
             )}
           </div>
         )}
@@ -315,6 +442,15 @@ export default function App() {
               {result.stock_code} · {result.algorithm.toUpperCase()} ({result.net.toUpperCase()})
               · 학습 {result.n_train}일 → 테스트 {result.n_test}일
               · 초기자본 {result.initial_balance.toLocaleString()}원
+              {result.dqn_options && (
+                <> · DQN 기법: {
+                  DQN_IMPROVEMENTS.filter((i) => result.dqn_options[i.id])
+                    .map((i) => i.label).join(', ') || '미적용(기존 방식)'
+                }</>
+              )}
+              {result.model_id && (
+                <> · 모델: {result.model_id}{result.saved_model_used ? ' (재사용)' : ' (신규 저장)'}</>
+              )}
             </div>
           </div>
           <div className="panel">

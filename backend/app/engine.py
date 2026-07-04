@@ -19,9 +19,12 @@ if _VENDOR not in sys.path:
     sys.path.insert(0, _VENDOR)
 os.environ.setdefault("RLTRADER_BACKEND", "pytorch")
 
-from quantylab.rltrader.learners import DQNLearner, A2CLearner, PPOLearner  # noqa: E402
+from quantylab.rltrader.learners import (  # noqa: E402
+    DQNLearner, DQNPlusLearner, A2CLearner, PPOLearner,
+)
 
 from . import kis_client, features  # noqa: E402
+from .metrics import metrics_from_pv, restore_trades, extended_metrics  # noqa: E402
 
 TRADING_DAYS = 252
 
@@ -43,7 +46,7 @@ STOCKS = [
 def _make_learner(algo, code, chart_data, training_data, *, net, num_steps,
                   lr, discount_factor, num_epoches, balance,
                   min_trading_price, max_trading_price, start_epsilon,
-                  output_path, reuse_models):
+                  output_path, reuse_models, dqn_options=None):
     vpath = os.path.join(output_path, "value.mdl")
     ppath = os.path.join(output_path, "policy.mdl")
     common = dict(
@@ -55,7 +58,10 @@ def _make_learner(algo, code, chart_data, training_data, *, net, num_steps,
         reuse_models=reuse_models,
     )
     if algo == "dqn":
-        return DQNLearner(rl_method="dqn", value_network_path=vpath, **common)
+        # DQN 개선 기법(TD·Replay·Target·Double·Multi-step·PER·Dueling) 체크박스 옵션.
+        # 옵션이 모두 꺼져 있으면 기존 quantylab DQN 과 동일하게 동작한다.
+        return DQNPlusLearner(rl_method="dqn", value_network_path=vpath,
+                              dqn_options=dqn_options, **common)
     if algo == "a2c":
         return A2CLearner(rl_method="a2c", value_network_path=vpath,
                           policy_network_path=ppath, **common)
@@ -63,26 +69,6 @@ def _make_learner(algo, code, chart_data, training_data, *, net, num_steps,
         return PPOLearner(rl_method="ppo", value_network_path=vpath,
                           policy_network_path=ppath, **common)
     raise ValueError(f"지원하지 않는 알고리즘: {algo}")
-
-
-def _metrics_from_pv(pv: np.ndarray) -> Dict:
-    pv = np.asarray(pv, dtype=float)
-    if len(pv) < 2:
-        return dict(cumulative_return=0.0, annual_return=0.0, annual_vol=0.0,
-                    sharpe=0.0, mdd=0.0)
-    initial = pv[0]
-    cum = pv[-1] / initial - 1
-    rets = np.diff(pv) / pv[:-1]
-    ann_vol = float(np.std(rets) * math.sqrt(TRADING_DAYS)) if len(rets) > 1 else 0.0
-    mean_daily = float(np.mean(rets))
-    ann_ret = (1 + cum) ** (TRADING_DAYS / len(pv)) - 1
-    sharpe = (mean_daily / np.std(rets) * math.sqrt(TRADING_DAYS)) if np.std(rets) > 0 else 0.0
-    # 최대 낙폭(MDD)
-    peak = np.maximum.accumulate(pv)
-    dd = (pv - peak) / peak
-    mdd = float(dd.min())
-    return dict(cumulative_return=float(cum), annual_return=float(ann_ret),
-                annual_vol=ann_vol, sharpe=float(sharpe), mdd=mdd)
 
 
 def run_experiment(params: Dict, progress_callback: Optional[Callable] = None) -> Dict:
@@ -97,6 +83,11 @@ def run_experiment(params: Dict, progress_callback: Optional[Callable] = None) -
     balance = int(params.get("balance", 10_000_000))
     min_tp = int(params.get("min_trading_price", 100_000))
     max_tp = int(params.get("max_trading_price", 1_000_000))
+
+    # DQN 개선 기법 옵션 (dqn 알고리즘에서만 의미 있음). 의존성 정규화 후 사용.
+    dqn_options = None
+    if algo == "dqn":
+        dqn_options = DQNPlusLearner.normalize_options(params.get("dqn_options"))
 
     # state 에 포함할 지표 선택 (없으면 전체). 검증 후 정렬된 컬럼 리스트.
     feature_cols = features.resolve_feature_columns(params.get("features"))
@@ -145,7 +136,7 @@ def run_experiment(params: Dict, progress_callback: Optional[Callable] = None) -
         algo, code, cd_tr, td_tr, net=net, num_steps=num_steps, lr=lr,
         discount_factor=discount_factor, num_epoches=num_epoches, balance=balance,
         min_trading_price=min_tp, max_trading_price=max_tp, start_epsilon=1.0,
-        output_path=output_path, reuse_models=False,
+        output_path=output_path, reuse_models=False, dqn_options=dqn_options,
     )
     learner.visualize_enabled = False
     learner.run(learning=True, progress_callback=_train_cb)
@@ -158,7 +149,7 @@ def run_experiment(params: Dict, progress_callback: Optional[Callable] = None) -
         algo, code, cd_te, td_te, net=net, num_steps=num_steps, lr=lr,
         discount_factor=discount_factor, num_epoches=1, balance=balance,
         min_trading_price=min_tp, max_trading_price=max_tp, start_epsilon=0.0,
-        output_path=output_path, reuse_models=True,
+        output_path=output_path, reuse_models=True, dqn_options=dqn_options,
     )
     tester.visualize_enabled = False
     tester.run(learning=False)
@@ -177,46 +168,16 @@ def run_experiment(params: Dict, progress_callback: Optional[Callable] = None) -
     else:
         bh_pv = []
 
-    # ---- 체결 내역 복원 (보유주식 수 변화 기반) + 매도별 실현손익 ----
+    # ---- 체결 내역 복원 + 성과지표 (공용 metrics 모듈) ----
     num_stocks = list(tester.memory_num_stocks)[:len(dates)]
-    CHARGE = tester.agent.TRADING_CHARGE
-    TAX = tester.agent.TRADING_TAX
-    trades_log = []
-    prev_shares = 0
-    avg_cost = 0.0           # 1주당 평균 매입원가(매수 수수료 포함)
-    total_traded_amount = 0.0
-    total_realized_profit = 0.0
-    for i in range(len(dates)):
-        shares = int(num_stocks[i]) if i < len(num_stocks) else prev_shares
-        price = float(closes[i])
-        delta = shares - prev_shares
-        if delta > 0:  # 매수
-            qty = delta
-            buy_cost_per = price * (1 + CHARGE)
-            avg_cost = (avg_cost * prev_shares + buy_cost_per * qty) / (prev_shares + qty)
-            amount = qty * price
-            total_traded_amount += amount
-            trades_log.append({
-                "date": dates[i], "side": "buy", "shares": qty, "price": price,
-                "amount": amount, "holding_after": shares,
-            })
-        elif delta < 0:  # 매도
-            qty = -delta
-            proceeds_per = price * (1 - CHARGE - TAX)
-            profit = (proceeds_per - avg_cost) * qty
-            ret = (proceeds_per / avg_cost - 1) if avg_cost > 0 else 0.0
-            amount = qty * price
-            total_traded_amount += amount
-            total_realized_profit += profit
-            trades_log.append({
-                "date": dates[i], "side": "sell", "shares": qty, "price": price,
-                "amount": amount, "profit": float(profit), "return": float(ret),
-                "avg_cost": float(avg_cost), "holding_after": shares,
-            })
-        prev_shares = shares
+    trades_log, trade_summary = restore_trades(
+        dates, closes, num_stocks,
+        charge=tester.agent.TRADING_CHARGE, tax=tester.agent.TRADING_TAX)
 
-    model_metrics = _metrics_from_pv(np.array(model_pv))
-    bh_metrics = _metrics_from_pv(np.array(bh_pv))
+    model_metrics = metrics_from_pv(np.array(model_pv))
+    model_metrics.update(extended_metrics(trades_log, dates, model_pv))
+    bh_metrics = metrics_from_pv(np.array(bh_pv))
+    bh_metrics.update(extended_metrics([], dates, bh_pv))
 
     return {
         "stock_code": code,
@@ -241,11 +202,8 @@ def run_experiment(params: Dict, progress_callback: Optional[Callable] = None) -
             "num_stocks": [int(x) for x in num_stocks],
         },
         "trade_log": trades_log,
-        "trade_summary": {
-            "total_traded_amount": float(total_traded_amount),
-            "total_realized_profit": float(total_realized_profit),
-            "num_trades": len(trades_log),
-        },
+        "trade_summary": trade_summary,
         "metrics": {"model": model_metrics, "buyhold": bh_metrics},
         "initial_balance": balance,
+        "dqn_options": dqn_options,   # 적용된 DQN 개선 기법 (dqn 외 알고리즘은 None)
     }

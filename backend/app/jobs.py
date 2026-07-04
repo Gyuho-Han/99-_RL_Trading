@@ -41,9 +41,22 @@ def _run(job_id: str, params: Dict):
              error=str(e), traceback=traceback.format_exc())
 
 
+# 완료/오류 작업 최대 보관 수 (결과에 시계열·체결 내역이 포함돼 메모리를 차지하므로
+# 오래된 것부터 정리한다. dict 는 삽입 순서를 유지하므로 앞쪽이 오래된 작업)
+MAX_FINISHED_JOBS = 20
+
+
+def _prune_old_jobs():
+    """보관 한도를 넘긴 완료/오류 작업을 오래된 순으로 제거 (락 보유 상태에서 호출)."""
+    finished = [jid for jid, j in _jobs.items() if j.get("status") in ("done", "error")]
+    for jid in finished[:max(0, len(finished) - MAX_FINISHED_JOBS)]:
+        del _jobs[jid]
+
+
 def start_job(params: Dict) -> str:
     job_id = uuid.uuid4().hex[:12]
     with _lock:
+        _prune_old_jobs()
         _jobs[job_id] = {"id": job_id, "status": "queued", "phase": "queued",
                          "progress": 0.0, "params": params}
     t = threading.Thread(target=_run, args=(job_id, params), daemon=True)

@@ -5,6 +5,7 @@
   GET  /api/stocks           테스트 종목 3종
   GET  /api/algorithms       알고리즘 메타(quantylab: DQN/A2C/PPO)
   GET  /api/engines          엔진별(quantylab/hanium) 알고리즘·네트워크 메타
+  GET  /api/models           저장된 hanium 학습 모델 목록
   POST /api/train            실험 시작 -> {job_id}
   GET  /api/jobs/{job_id}    진행상황/결과 폴링
 """
@@ -23,6 +24,33 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class DQNOptions(BaseModel):
+    """DQN 한계 극복 기법 체크박스 (quantylab 엔진 + dqn 알고리즘에서만 사용).
+
+    의존성: replay/target/multistep 은 td 필요, double 은 target 필요, per 는 replay 필요.
+    (백엔드에서 normalize_options 로 다시 한 번 정리하므로 잘못 보내도 안전)
+    """
+    td: bool = False          # 1-step TD 학습 (스텝 보상 + 부트스트랩)
+    replay: bool = False      # Experience Replay
+    target: bool = False      # Target Network
+    double: bool = False      # Double DQN
+    multistep: bool = False   # Multi-step Learning
+    n_step: int = Field(3, ge=2, le=10)
+    per: bool = False         # Prioritized Experience Replay
+    dueling: bool = False     # Dueling DQN (V+A 분리 헤드)
+
+
+class HaniumRewardOptions(BaseModel):
+    """hanium TradingEnv 보상 셰이핑 계수 (모두 0이면 기존 순수 PV 변화율 보상).
+
+    PPT 개선 실험 기준값 예시: trade_penalty 0.0005, mdd_penalty 0.3
+    """
+    sell_profit_bonus: float = Field(0.0, ge=0, le=10)   # 실현수익 보너스 계수
+    loss_sell_penalty: float = Field(0.0, ge=0, le=10)   # 손실 매도 패널티 계수
+    trade_penalty: float = Field(0.0, ge=0, le=0.1)      # 체결 1회당 고정 패널티
+    mdd_penalty: float = Field(0.0, ge=0, le=10)         # 낙폭 갱신 패널티 계수
 
 
 class TrainRequest(BaseModel):
@@ -47,6 +75,12 @@ class TrainRequest(BaseModel):
     balance: int = Field(10_000_000, gt=0)
     # state 에 포함할 지표 id 목록. None/빈 값이면 전체 지표 사용.
     features: list[str] | None = None
+    # DQN 개선 기법 체크박스 (quantylab + dqn 전용, None 이면 전부 미적용=기존 방식)
+    dqn_options: DQNOptions | None = None
+    # hanium 보상 셰이핑 계수 (None 이면 전부 0 = 기존 보상)
+    reward_options: HaniumRewardOptions | None = None
+    # hanium 저장 모델 재사용: 모델 id(디렉터리명). 지정 시 학습 생략, 백테스트만 수행.
+    saved_model: str | None = None
 
     def validate_engine_choice(self):
         """엔진별 알고리즘/네트워크 후보 검증."""
@@ -55,6 +89,8 @@ class TrainRequest(BaseModel):
         else:
             algos = set(engine_hanium.HANIUM_ALGORITHMS)
             nets = set(engine_hanium.HANIUM_NETWORKS)
+            if self.saved_model:
+                return  # 저장 모델 재사용 시 알고리즘/네트워크는 metadata 가 결정
         if self.algorithm not in algos:
             raise HTTPException(400, f"'{self.engine}' 엔진에서 지원하지 않는 알고리즘: {self.algorithm}")
         if self.net is not None and self.net not in nets:
@@ -106,6 +142,12 @@ def engines():
 def feature_list():
     """state 에 넣을 수 있는 지표 목록(체크박스 UI 용)."""
     return features.FEATURE_META
+
+
+@app.get("/api/models")
+def saved_models():
+    """저장된 hanium 학습 모델 목록 (최신순, 재사용 드롭다운용)."""
+    return engine_hanium.list_saved_models()
 
 
 @app.post("/api/train")

@@ -8,18 +8,39 @@ import torch
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
+class DuelingHead(torch.nn.Module):
+    """Dueling DQN 헤드 (오승상 DRL 강의자료 p.82-85).
+
+    공통 특성 벡터를 상태가치 V(s) 스트림과 어드밴티지 A(s,a) 스트림으로 분리한 뒤
+    Q(s,a) = V(s) + A(s,a) - mean_a A(s,a) 로 합성한다.
+    (mean 차감은 V/A 분해의 식별성(identifiability) 문제 해결용 — 강의자료 p.84-85)
+    """
+
+    def __init__(self, in_features, num_actions):
+        super().__init__()
+        self.value = torch.nn.Linear(in_features, 1)
+        self.advantage = torch.nn.Linear(in_features, num_actions)
+
+    def forward(self, x):
+        v = self.value(x)
+        a = self.advantage(x)
+        return v + a - a.mean(dim=1, keepdim=True)
+
+
 class Network:
     lock = threading.Lock()
 
-    def __init__(self, input_dim=0, output_dim=0, lr=0.001, 
-                shared_network=None, activation='sigmoid', loss='mse'):
+    def __init__(self, input_dim=0, output_dim=0, lr=0.001,
+                shared_network=None, activation='sigmoid', loss='mse',
+                dueling=False):
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.lr = lr
         self.shared_network = shared_network
         self.activation = activation
         self.loss = loss
-        
+        self.dueling = dueling
+
         inp = None
         if hasattr(self, 'num_steps'):
             inp = (self.num_steps, input_dim)
@@ -30,6 +51,9 @@ class Network:
         self.head = None
         if self.shared_network is None:
             self.head = self.get_network_head(inp, self.output_dim)
+            # Dueling 구조: 마지막 Linear 층을 V/A 이중 스트림 헤드로 교체
+            if dueling:
+                self.head = self._to_dueling(self.head, self.output_dim)
         else:
             self.head = self.shared_network
         
@@ -60,6 +84,16 @@ class Network:
         elif loss == 'binary_crossentropy':
             self.criterion = torch.nn.BCELoss()
 
+    @staticmethod
+    def _to_dueling(head, output_dim):
+        """헤드 마지막 Linear 층을 DuelingHead(V+A 스트림)로 교체한다."""
+        modules = list(head.children())
+        last = modules[-1]
+        if not isinstance(last, torch.nn.Linear):
+            return head  # 예상 구조가 아니면 그대로 사용
+        feature = torch.nn.Sequential(*modules[:-1])
+        return torch.nn.Sequential(feature, DuelingHead(last.in_features, output_dim))
+
     def predict(self, sample):
         with self.lock:
             self.model.eval()
@@ -69,19 +103,38 @@ class Network:
                 pred = pred.flatten()
             return pred
 
-    def train_on_batch(self, x, y):
+    def predict_on_batch(self, x):
+        """배치 예측 (B, output_dim). DQN 개선 기법의 타깃 계산용."""
+        with self.lock:
+            self.model.eval()
+            with torch.no_grad():
+                t = torch.from_numpy(np.asarray(x, dtype=np.float32)).to(device)
+                return self.model(t).detach().cpu().numpy()
+
+    def train_on_batch(self, x, y, weights=None):
+        """배치 학습. weights 가 주어지면 샘플별 가중 MSE (PER 의 IS 보정용)."""
         loss = 0.
         with self.lock:
             self.model.train()
             x = torch.from_numpy(x).float().to(device)
             y = torch.from_numpy(y).float().to(device)
             y_pred = self.model(x)
-            _loss = self.criterion(y_pred, y)
+            if weights is not None:
+                w = torch.from_numpy(np.asarray(weights, dtype=np.float32)).to(device)
+                per_sample = ((y_pred - y) ** 2).mean(dim=1)
+                _loss = (w * per_sample).mean()
+            else:
+                _loss = self.criterion(y_pred, y)
             self.optimizer.zero_grad()
             _loss.backward()
             self.optimizer.step()
             loss += _loss.item()
         return loss
+
+    def copy_weights_from(self, other):
+        """타깃 네트워크 하드 업데이트: other(행동망)의 가중치를 복사한다."""
+        with self.lock:
+            self.model.load_state_dict(other.model.state_dict())
 
     @classmethod
     def get_shared_network(cls, net='dnn', num_steps=1, input_dim=0, output_dim=0):
@@ -135,13 +188,17 @@ class DNN(Network):
             torch.nn.Linear(32, output_dim),
         )
 
-    def train_on_batch(self, x, y):
+    def train_on_batch(self, x, y, weights=None):
         x = np.array(x).reshape((-1, self.input_dim))
-        return super().train_on_batch(x, y)
+        return super().train_on_batch(x, y, weights=weights)
 
     def predict(self, sample):
         sample = np.array(sample).reshape((1, self.input_dim))
         return super().predict(sample)
+
+    def predict_on_batch(self, x):
+        x = np.array(x).reshape((-1, self.input_dim))
+        return super().predict_on_batch(x)
 
 
 class LSTMNetwork(Network):
@@ -165,13 +222,17 @@ class LSTMNetwork(Network):
             torch.nn.Linear(32, output_dim),
         )
 
-    def train_on_batch(self, x, y):
+    def train_on_batch(self, x, y, weights=None):
         x = np.array(x).reshape((-1, self.num_steps, self.input_dim))
-        return super().train_on_batch(x, y)
+        return super().train_on_batch(x, y, weights=weights)
 
     def predict(self, sample):
         sample = np.array(sample).reshape((-1, self.num_steps, self.input_dim))
         return super().predict(sample)
+
+    def predict_on_batch(self, x):
+        x = np.array(x).reshape((-1, self.num_steps, self.input_dim))
+        return super().predict_on_batch(x)
 
 
 class LSTMModule(torch.nn.LSTM):
@@ -212,10 +273,14 @@ class CNN(Network):
             torch.nn.Linear(32, output_dim),
         )
 
-    def train_on_batch(self, x, y):
+    def train_on_batch(self, x, y, weights=None):
         x = np.array(x).reshape((-1, self.num_steps, self.input_dim))
-        return super().train_on_batch(x, y)
+        return super().train_on_batch(x, y, weights=weights)
 
     def predict(self, sample):
         sample = np.array(sample).reshape((1, self.num_steps, self.input_dim))
         return super().predict(sample)
+
+    def predict_on_batch(self, x):
+        x = np.array(x).reshape((-1, self.num_steps, self.input_dim))
+        return super().predict_on_batch(x)
