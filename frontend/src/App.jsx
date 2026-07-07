@@ -39,14 +39,23 @@ export default function App() {
 
   const [stock, setStock] = useState('005930')
   const [algo, setAlgo] = useState('dqn')
+  // quantylab 전용: 복수 선택(1~3개) → 앙상블
+  const [qlAlgos, setQlAlgos] = useState(['dqn'])
+  // 앙상블 방식: 'sharpe'(논문: 검증 Sharpe 선택+롤링 재선정+turbulence) / 'vote'(다수결)
+  const [ensMethod, setEnsMethod] = useState('sharpe')
+  const [ensWindow, setEnsWindow] = useState(21)
   const [net, setNet] = useState('dnn')
   const [windowSize, setWindowSize] = useState(20)
-  const [trainStart, setTrainStart] = useState('2022-01-01')
-  const [trainEnd, setTrainEnd] = useState('2024-06-30')
-  const [testStart, setTestStart] = useState('2024-07-01')
-  const [testEnd, setTestEnd] = useState('2025-06-30')
-  const [epochs, setEpochs] = useState(80)
+  const [trainStart, setTrainStart] = useState('2017-01-01')
+  const [trainEnd, setTrainEnd] = useState('2022-12-31')
+  const [testStart, setTestStart] = useState('2023-01-01')
+  const [testEnd, setTestEnd] = useState(new Date().toISOString().slice(0, 10))
+  const [epochs, setEpochs] = useState(40)
   const [lr, setLr] = useState(0.0005)
+  // 초기자본 (두 엔진 공통)
+  const [balance, setBalance] = useState(10000000)
+  // 1회 최소 매매 금액 (quantylab): 신뢰도에 비례해 min~잔고 전액 사이 금액 주문
+  const [minTp, setMinTp] = useState(100000)
   const [showAdv, setShowAdv] = useState(false)
 
   const [featureMeta, setFeatureMeta] = useState([])
@@ -118,7 +127,21 @@ export default function App() {
       return next
     })
   }
-  const showDqnOpts = engine === 'quantylab' && algo === 'dqn'
+  // quantylab 알고리즘 복수 선택 토글 (최소 1개 유지, 1개만 남으면 기본 네트워크 적용)
+  function toggleQlAlgo(id) {
+    setQlAlgos((prev) => {
+      const next = prev.includes(id)
+        ? (prev.length > 1 ? prev.filter((x) => x !== id) : prev)
+        : [...prev, id]
+      if (next.length === 1) {
+        const meta = algoList.find((x) => x.id === next[0])
+        if (meta?.net_default) setNet(meta.net_default)
+      }
+      return next
+    })
+  }
+  const qlEnsemble = engine === 'quantylab' && qlAlgos.length > 1
+  const showDqnOpts = engine === 'quantylab' && qlAlgos.includes('dqn')
 
   // group -> [feature, ...] 로 묶기 (메타 순서 유지)
   const featureGroups = featureMeta.reduce((acc, f) => {
@@ -140,6 +163,7 @@ export default function App() {
         train_start: trainStart, train_end: trainEnd,
         test_start: testStart, test_end: testEnd,
         lr: Number(lr), features: selectedFeatures,
+        balance: Number(balance),
       }
       if (engine === 'hanium') {
         body.episodes = Number(epochs)
@@ -153,8 +177,13 @@ export default function App() {
         }
         if (savedModel) body.saved_model = savedModel
       } else {
+        body.algorithm = qlAlgos[0]
+        body.algorithms = qlAlgos          // 2개 이상이면 앙상블
+        body.ensemble_method = ensMethod
+        body.ensemble_window = Number(ensWindow)
         body.num_epoches = Number(epochs)
-        if (algo === 'dqn') body.dqn_options = dqnOpts
+        body.min_trading_price = Number(minTp)
+        if (qlAlgos.includes('dqn')) body.dqn_options = dqnOpts
       }
       const { job_id } = await api.train(body)
       setJob({ status: 'queued', phase: 'queued', progress: 0 })
@@ -228,28 +257,64 @@ export default function App() {
 
       <div className="panel">
         <h2>③ 알고리즘 · 네트워크</h2>
-        <div className="feat-group-title">알고리즘 ({algoList.length}종)</div>
+        <div className="feat-group-title">
+          알고리즘 ({algoList.length}종)
+          {engine === 'quantylab' && ' — 복수 선택 시 다수결 앙상블'}
+        </div>
         <div className="row">
           {algoList.map((a) => (
             <button key={a.id}
-              className={`btn algo ${algo === a.id ? 'active' : ''}`}
-              onClick={() => { setAlgo(a.id); if (a.net_default) setNet(a.net_default) }}>
+              className={`btn algo ${(engine === 'quantylab'
+                ? qlAlgos.includes(a.id) : algo === a.id) ? 'active' : ''}`}
+              onClick={() => {
+                if (engine === 'quantylab') toggleQlAlgo(a.id)
+                else { setAlgo(a.id); if (a.net_default) setNet(a.net_default) }
+              }}>
               {a.label} <span className="sub">{a.desc}</span>
             </button>
           ))}
         </div>
-        <div className="feat-group-title" style={{ marginTop: 14 }}>
-          네트워크 ({netList.length}종) — 특성 추출기
-        </div>
-        <div className="row">
-          {netList.map((nw) => (
-            <button key={nw.id}
-              className={`btn small ${net === nw.id ? 'active' : ''}`}
-              onClick={() => setNet(nw.id)}>
-              {nw.label} <span className="sub">{nw.sub}</span>
-            </button>
-          ))}
-        </div>
+        {qlEnsemble && (
+          <>
+            <div className="feat-group-title" style={{ marginTop: 14 }}>앙상블 방식</div>
+            <div className="row">
+              <button className={`btn small ${ensMethod === 'sharpe' ? 'active' : ''}`}
+                onClick={() => setEnsMethod('sharpe')}>
+                Sharpe 선택 <span className="sub">Yang et al. (ICAIF 2020) — 권장</span>
+              </button>
+              <button className={`btn small ${ensMethod === 'vote' ? 'active' : ''}`}
+                onClick={() => setEnsMethod('vote')}>
+                다수결 투표 <span className="sub">매 스텝 과반 행동 (단순 베이스라인)</span>
+              </button>
+            </div>
+            <p className="note" style={{ marginTop: 8 }}>
+              {ensMethod === 'sharpe'
+                ? `앙상블(논문 방식): ${qlAlgos.map((x) => x.toUpperCase()).join(' + ')} 를 각각 학습한 뒤,
+                   학습 구간 끝을 검증 구간으로 분리해 Sharpe 최고 모델로 시작하고,
+                   테스트 중 ${ensWindow}거래일마다 최근 성과(그림자 포트폴리오 Sharpe) 최고 모델로 교체합니다.
+                   변동성(turbulence) 급등 시 전량 매도 후 매수를 중단하는 위험회피 규칙이 적용됩니다.`
+                : `앙상블(다수결): 매 스텝 ${qlAlgos.map((x) => x.toUpperCase()).join(' + ')} 의
+                   행동을 투표해 과반(동률이면 신뢰도 합) 행동을 실행합니다.`}
+              {' '}네트워크는 알고리즘별 기본값(DQN→DNN, A2C/PPO→LSTM)을 사용합니다.
+            </p>
+          </>
+        )}
+        {!qlEnsemble && (
+          <>
+            <div className="feat-group-title" style={{ marginTop: 14 }}>
+              네트워크 ({netList.length}종) — 특성 추출기
+            </div>
+            <div className="row">
+              {netList.map((nw) => (
+                <button key={nw.id}
+                  className={`btn small ${net === nw.id ? 'active' : ''}`}
+                  onClick={() => setNet(nw.id)}>
+                  {nw.label} <span className="sub">{nw.sub}</span>
+                </button>
+              ))}
+            </div>
+          </>
+        )}
         {engine === 'hanium' && (
           <>
             <p className="note" style={{ marginTop: 10 }}>
@@ -370,7 +435,7 @@ export default function App() {
         </div>
         <button className="toggle-adv" onClick={() => setShowAdv(!showAdv)}>
           {showAdv ? '− 고급 설정 숨기기'
-            : `+ 고급 설정 (${paramKind === 'episodes' ? '에피소드/윈도우/' : '에폭/'}학습률)`}
+            : `+ 고급 설정 (${paramKind === 'episodes' ? '에피소드/윈도우/초기자본/' : '에폭/초기자본/매매금액/'}학습률)`}
         </button>
         {showAdv && (
           <div className="sub-grid" style={{ marginTop: 10 }}>
@@ -381,6 +446,21 @@ export default function App() {
             <div className="field"><label>학습률 (lr)</label>
               <input type="number" step="0.0001" value={lr}
                 onChange={(e) => setLr(e.target.value)} /></div>
+            <div className="field"><label>초기자본 (원)</label>
+              <input type="number" step="1000000" min="100000" value={balance}
+                onChange={(e) => setBalance(e.target.value)} /></div>
+            {qlEnsemble && ensMethod === 'sharpe' && (
+              <div className="field"><label>앙상블 리더 재선정 주기 (거래일)</label>
+                <input type="number" min="5" max="126" value={ensWindow}
+                  onChange={(e) => setEnsWindow(e.target.value)} /></div>
+            )}
+            {engine === 'quantylab' && (
+              <>
+                <div className="field"><label>1회 최소 매매 금액 (원) — 최대는 잔고 전액</label>
+                  <input type="number" step="100000" min="10000" value={minTp}
+                    onChange={(e) => setMinTp(e.target.value)} /></div>
+              </>
+            )}
             {engine === 'hanium' && (
               <>
                 <div className="field"><label>관측 윈도우 (window_size, 일)</label>
@@ -440,6 +520,9 @@ export default function App() {
             <MetricsTable metrics={result.metrics} trades={result.trades} />
             <div className="note">
               {result.stock_code} · {result.algorithm.toUpperCase()} ({result.net.toUpperCase()})
+              {result.ensemble && (result.ensemble.method === 'sharpe_selection'
+                ? ` · 앙상블(Sharpe 선택, 시작 ${result.ensemble.initial_leader?.toUpperCase()})`
+                : ' · 앙상블(다수결)')}
               · 학습 {result.n_train}일 → 테스트 {result.n_test}일
               · 초기자본 {result.initial_balance.toLocaleString()}원
               {result.dqn_options && (
