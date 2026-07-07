@@ -28,6 +28,7 @@ class ReinforcementLearner:
                 net='dnn', num_steps=1, lr=0.0005, 
                 discount_factor=0.9, num_epoches=1000,
                 balance=100000000, start_epsilon=1,
+                min_epsilon=0.1,
                 value_network=None, policy_network=None,
                 output_path='', reuse_models=True):
         # 인자 확인
@@ -41,6 +42,11 @@ class ReinforcementLearner:
         self.discount_factor = discount_factor
         self.num_epoches = num_epoches
         self.start_epsilon = start_epsilon
+        # 탐험 하한(학습 시에만 적용). 기존 quantylab 은 마지막 에포크에서 ε=0 이
+        # 되어 학습 배치가 탐욕 행동(대개 관망)으로만 채워졌고, 한 번 Q(관망)이
+        # 앞서면 매수/매도 Q 가 갱신되지 못해 '전부 관망' 정책으로 붕괴하는
+        # 확률이 높았다. 후반 에포크에도 최소한의 탐험을 유지해 이를 완화한다.
+        self.min_epsilon = min_epsilon
         # 환경 설정
         self.stock_code = stock_code
         self.chart_data = chart_data
@@ -248,9 +254,13 @@ class ReinforcementLearner:
             # 환경, 에이전트, 신경망, 가시화, 메모리 초기화
             self.reset()
 
-            # 학습을 진행할 수록 탐험 비율 감소
+            # 학습을 진행할 수록 탐험 비율 감소 (min_epsilon 하한 유지)
             if learning:
-                epsilon = self.start_epsilon * (1 - (epoch / (self.num_epoches - 1)))
+                if self.num_epoches > 1:
+                    epsilon = self.start_epsilon * (1 - (epoch / (self.num_epoches - 1)))
+                else:
+                    epsilon = self.start_epsilon
+                epsilon = max(epsilon, self.min_epsilon)
             else:
                 epsilon = self.start_epsilon
 
@@ -582,6 +592,8 @@ class DQNPlusLearner(DQNLearner):
                 epsilon = self.start_epsilon * (1 - (epoch / (self.num_epoches - 1)))
             else:
                 epsilon = self.start_epsilon
+            if learning:
+                epsilon = max(epsilon, self.min_epsilon)  # 탐험 하한 (정책 붕괴 방지)
 
             prev_pl = 0.0
             nstep_q = collections.deque()   # (state, action, step_reward)

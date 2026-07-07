@@ -59,13 +59,24 @@ class TrainRequest(BaseModel):
     engine: str = Field("quantylab", pattern="^(quantylab|hanium)$")
     # 알고리즘/네트워크는 엔진마다 후보가 달라 자유 문자열로 받고 엔진에서 검증한다.
     algorithm: str
+    # quantylab 전용: 복수 알고리즘 앙상블 (1~3개). 지정 시 algorithm 보다 우선.
+    algorithms: list[str] | None = None
+    # 앙상블 방식: 'sharpe'(Yang et al. ICAIF 2020 — 검증 Sharpe 선택 + 롤링 재선정
+    # + turbulence 위험회피, 기본값) 또는 'vote'(단순 다수결)
+    ensemble_method: str = Field("sharpe", pattern="^(sharpe|vote)$")
+    # sharpe 방식의 리더 재선정 주기 (거래일)
+    ensemble_window: int = Field(21, ge=5, le=126)
+    # turbulence 위험회피 규칙 사용 여부 (sharpe 방식에서만 의미 있음)
+    use_turbulence: bool = True
     net: str | None = None
     train_start: str
     train_end: str
     test_start: str
     test_end: str
     # quantylab: 학습 에포크 수 / hanium: episodes 로 매핑(아래 별도 필드)
-    num_epoches: int = Field(100, ge=1, le=2000)
+    # 기본 40: 삼성전자(학습 2017~2022/테스트 2023~) 에폭 스윕 결과 20/40/80 중
+    # 40이 수익률 최고, 80은 시간 2배에 성능 동일 수준이라 40을 기본값으로 채택.
+    num_epoches: int = Field(40, ge=1, le=2000)
     episodes: int | None = Field(None, ge=1, le=2000)
     lr: float = Field(0.0005, gt=0)
     discount_factor: float = Field(0.9, gt=0, le=1)
@@ -73,6 +84,14 @@ class TrainRequest(BaseModel):
     window_size: int | None = Field(None, ge=5, le=120)   # hanium 관측 윈도우
     trade_ratio: float | None = Field(None, gt=0, le=1)    # hanium 부분 매매 비율
     balance: int = Field(10_000_000, gt=0)
+    # 1회 최소 매매 금액 (quantylab 엔진 전용).
+    # 매수/매도 시 '신뢰도(confidence)'에 비례해 min~잔고 사이 금액만큼 주문한다.
+    # (금액 = min + confidence·(balance-min), 상한 없음 = 잔고 전액까지)
+    min_trading_price: int = Field(100_000, gt=0)
+    # (선택) 1회 최대 매매 금액. 미지정 시 잔고 전액.
+    max_trading_price: int | None = Field(None, gt=0)
+    # 재현용 난수 시드 (None 이면 실행마다 무작위 → 결과가 매번 달라짐)
+    seed: int | None = None
     # state 에 포함할 지표 id 목록. None/빈 값이면 전체 지표 사용.
     features: list[str] | None = None
     # DQN 개선 기법 체크박스 (quantylab + dqn 전용, None 이면 전부 미적용=기존 방식)
@@ -84,8 +103,22 @@ class TrainRequest(BaseModel):
 
     def validate_engine_choice(self):
         """엔진별 알고리즘/네트워크 후보 검증."""
+        if self.max_trading_price is not None and self.max_trading_price < self.min_trading_price:
+            raise HTTPException(400, "max_trading_price 는 min_trading_price 이상이어야 합니다.")
+        if self.min_trading_price > self.balance:
+            raise HTTPException(400, "min_trading_price 가 초기자본(balance)보다 큽니다.")
         if self.engine == "quantylab":
             algos, nets = {"dqn", "a2c", "ppo"}, {"dnn", "lstm", "cnn"}
+            if self.algorithms:
+                sel = [a for a in dict.fromkeys(self.algorithms) if a]
+                bad = [a for a in sel if a not in algos]
+                if not sel:
+                    raise HTTPException(400, "algorithms 는 1개 이상 선택해야 합니다.")
+                if bad:
+                    raise HTTPException(400, f"'quantylab' 엔진에서 지원하지 않는 알고리즘: {bad}")
+                if len(sel) > 3:
+                    raise HTTPException(400, "앙상블은 최대 3개(dqn/a2c/ppo)까지 선택 가능합니다.")
+                return  # 앙상블은 알고리즘별 기본 네트워크를 사용하므로 net 검증 생략
         else:
             algos = set(engine_hanium.HANIUM_ALGORITHMS)
             nets = set(engine_hanium.HANIUM_NETWORKS)
